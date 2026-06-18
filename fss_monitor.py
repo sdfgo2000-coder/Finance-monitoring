@@ -24,25 +24,18 @@ from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr, parsedate_to_datetime, make_msgid
 import requests, pdfplumber
 
-# ── 설정 ─────────────────────────────────────────────────────────────
-# 직전 6개월 평균(설정값) — FSS 일일 PDF엔 6개월 시계열이 없어 여기서 관리.
-# 월 1회 정도 갱신하세요. (추후 ECOS 연동 시 자동화 가능)
+# ── 설정 ────────────────────────────────────────────────────────────
 SIX_MONTH_AVG = {"kospi": 5574, "fx": 1473, "ktb3": 3.27}
 
-# ECOS(한국은행) 6개월 평균 자동계산용 통계코드. 실패 시 위 SIX_MONTH_AVG로 자동 대체.
-#   환율 731Y001/0000001, 국고채3년 817Y002/010200000  ← 확신
-#   코스피 802Y001/0001000  ← 미확정(로그 [ECOS] 확인 후 조정)
 ECOS_SERIES = {
     "fx":    {"stat": "731Y001", "item": "0000001",   "cycle": "D"},
     "ktb3":  {"stat": "817Y002", "item": "010200000", "cycle": "D"},
     "kospi": {"stat": "802Y001", "item": "0001000",   "cycle": "D"},
 }
 
-ABS_TRIGGER  = (100, 250)   # CDS·스프레드 절대수준(bp) 1단계/2단계
-CRISIS_COUNT = 2            # N개 이상 지표 진입 시 위기 선포
+ABS_TRIGGER  = (100, 250)
+CRISIS_COUNT = 2
 
-# 외인 투자자금 2개월 누적 순매수 트리거(조원). 순유출(음수)이 클수록 위험.
-#   1단계 -5조 이하, 2단계 -7조 이하 진입 시 발동.
 FOREIGN_TRIGGER = (-5.0, -7.0)
 KRX_API = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 
@@ -53,9 +46,6 @@ KST = dt.timezone(dt.timedelta(hours=9))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-# ── 삼성 주요 국내 계열사 신문스크랩 설정 ──────────────────────────
-# (그룹명, [검색 키워드…], 배너이미지파일) — 카드 한 칸 = 한 그룹
-#   배너 PNG는 assets/news/ 에 고정 보관(생성기: scripts/gen_news_images.py).
 SAMSUNG_GROUPS = [
     ("삼성전자",                 ["삼성전자"],                              "samsung_electronics.png"),
     ("전자 계열 (SDI·전기·SDS)", ["삼성SDI", "삼성전기", "삼성SDS"],          "electronics_group.png"),
@@ -64,22 +54,21 @@ SAMSUNG_GROUPS = [
     ("기타 국내 계열사",          ["삼성중공업", "삼성E&A", "호텔신라", "제일기획", "에스원"], "others.png"),
 ]
 ASSET_DIR          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "news")
-NEWS_PER_KEYWORD   = int(os.environ.get("NEWS_PER_KEYWORD", "6"))   # 키워드당 수집 후보 수
-NEWS_PER_GROUP     = int(os.environ.get("NEWS_PER_GROUP", "3"))     # 그룹당 최종 표시 기사 수(카드당 3개)
-NEWS_CANDIDATES    = int(os.environ.get("NEWS_CANDIDATES", "8"))    # 그룹당 AI 선별에 넘길 후보 수
-NEWS_CUTOFF_HM     = (7, 11)  # 수집 구간 경계: 전(영업)일 07:11 ~ 금일 07:11 KST
-NEWS_SUMMARY_MODEL = os.environ.get("NEWS_SUMMARY_MODEL", "claude-opus-4-8")  # 선별·요약 모델
+NEWS_PER_KEYWORD   = int(os.environ.get("NEWS_PER_KEYWORD", "6"))
+NEWS_PER_GROUP     = int(os.environ.get("NEWS_PER_GROUP", "3"))
+NEWS_CANDIDATES    = int(os.environ.get("NEWS_CANDIDATES", "8"))
+NEWS_CUTOFF_HM     = (7, 11)
+NEWS_SUMMARY_MODEL = os.environ.get("NEWS_SUMMARY_MODEL", "claude-opus-4-8")
 
 
-# ── 1. 금감원 API: 당일 '일일 동향' PDF 링크 ────────────────────────
+# ── 1. 금감원 API ────────────────────────────────────────────────────
 def fetch_daily_pdf_url(auth_key):
     today = dt.datetime.now(KST).date()
     params = {"apiType": "json",
               "startDate": (today - dt.timedelta(days=LOOKBACK)).strftime("%Y%m%d"),
               "endDate": today.strftime("%Y%m%d"),
               "authKey": (auth_key or "").strip()}
-    headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")}
+    headers = {"User-Agent": UA}
     r = requests.get(API, params=params, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -101,7 +90,7 @@ def download_pdf(url):
     return BytesIO(r.content)
 
 
-# ── 2. 추출 ─────────────────────────────────────────────────────────
+# ── 2. PDF 추출 ──────────────────────────────────────────────────────
 def _today_value(line):
     nums = []
     for t in line.split():
@@ -120,11 +109,11 @@ def extract(pdf_io):
         s = ln.strip()
         if "CDS Premium" in s:
             in_cds = True
-        if s.startswith("KOSPI"):            v["kospi"] = _today_value(s)
-        elif s.startswith("USDKRW"):         v["fx"]    = _today_value(s)
-        elif "국고채(3년)" in s:             v["ktb3"]  = _today_value(s)
-        elif "회사채(3년" in s:              v["corp3"] = _today_value(s)
-        elif in_cds and s.startswith("한국"): v["cds"]  = _today_value(s)
+        if s.startswith("KOSPI"):             v["kospi"] = _today_value(s)
+        elif s.startswith("USDKRW"):          v["fx"]    = _today_value(s)
+        elif "국고채(3년)" in s:              v["ktb3"]  = _today_value(s)
+        elif "회사채(3년" in s:               v["corp3"] = _today_value(s)
+        elif in_cds and s.startswith("한국"):  v["cds"]   = _today_value(s)
 
     miss = [k for k in ("kospi", "fx", "ktb3", "corp3", "cds") if v.get(k) is None]
     if miss:
@@ -135,12 +124,16 @@ def extract(pdf_io):
     m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\([월화수목금토일]\)\s*기준", text)
     v["base_date"] = (f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m
                       else dt.datetime.now(KST).strftime("%Y-%m-%d"))
-    v["spread"] = round((v["corp3"] - v["ktb3"]) * 100, 1)   # bp
+    v["spread"] = round((v["corp3"] - v["ktb3"]) * 100, 1)
     return v
 
 
-# ── 2-B. KRX: 외인 투자자금 2개월 누적 순매수(코스피+코스닥+채권) ────
+# ── 2-B. KRX: 외인 투자자금 2개월 누적 순매수 ───────────────────────
 def _krx_post(data):
+    """KRX 인증키가 있으면 AUTH_KEY 파라미터를 추가해 인증 요청."""
+    krx_key = (os.environ.get("KRX_AUTH_KEY") or "").strip()
+    if krx_key:
+        data = {**data, "AUTH_KEY": krx_key}
     headers = {"User-Agent": UA, "Referer": "http://data.krx.co.kr/",
                "X-Requested-With": "XMLHttpRequest"}
     r = requests.post(KRX_API, data=data, headers=headers, timeout=30)
@@ -149,8 +142,7 @@ def _krx_post(data):
 
 
 def _pick_foreign_net(rows):
-    """투자자별 거래실적 행에서 외국인(외국인+기타외국인) 순매수 거래대금(원) 합산 반환.
-       순매수 필드명은 KRX 화면마다 달라 다수 후보로 파싱. 미발견 시 None."""
+    """투자자별 거래실적 행에서 외국인 순매수 거래대금(원) 합산 반환."""
     NET_FIELDS = ("NETBID_TRDVAL", "NETBID_TRDVAL_AGG", "NETBYACC_TRDVAL",
                   "NET_TRDVAL", "NETBYVAL", "TRDVAL", "NETBYACC", "NETBID")
     total, found = 0.0, False
@@ -169,7 +161,7 @@ def _pick_foreign_net(rows):
 
 
 def _krx_investor_net(candidates):
-    """후보 파라미터셋을 순서대로 시도, 행이 있는 응답에서 외국인 순매수 합(원) 반환."""
+    """후보 파라미터셋을 순서대로 시도, 외국인 순매수 합(원) 반환."""
     last = None
     for data in candidates:
         try:
@@ -190,8 +182,7 @@ def _krx_investor_net(candidates):
 
 
 def foreign_flows_2m():
-    """어제 기준 직전 2개월 외인 순매수 누적(코스피+코스닥+채권) 합산 → 조원.
-       일부/전부 실패 시 가능한 만큼 합산하고 진단 로그 출력. 전부 실패면 None."""
+    """어제 기준 직전 2개월 외인 순매수 누적(코스피+코스닥+채권) → 조원."""
     today = dt.datetime.now(KST).date()
     end = today - dt.timedelta(days=1)
     y, mo = end.year, end.month - 2
@@ -204,13 +195,12 @@ def foreign_flows_2m():
     print(f"[KRX] 외인 2개월 구간: {s} ~ {e}")
 
     def stock(mkt):
-        # [12009] 투자자별 거래실적(시장전체, 기간합계) = MDCSTAT02401
-        common = {"mktId": mkt, "strtDd": s, "endDd": e,
-                  "share": "1", "money": "1", "csvxls_isNo": "false"}
+        base = {"mktId": mkt, "strtDd": s, "endDd": e,
+                "share": "1", "money": "1", "csvxls_isNo": "false"}
         return [
-            {**common, "bld": "dbms/MDC/STAT/standard/MDCSTAT02401", "inqTpCd": "2"},
-            {**common, "bld": "dbms/MDC/STAT/standard/MDCSTAT02401"},
-            {**common, "bld": "dbms/MDC/STAT/standard/MDCSTAT02203", "inqTpCd": "2"},
+            {**base, "bld": "dbms/MDC/STAT/standard/MDCSTAT02401", "inqTpCd": "2"},
+            {**base, "bld": "dbms/MDC/STAT/standard/MDCSTAT02401"},
+            {**base, "bld": "dbms/MDC/STAT/standard/MDCSTAT02203", "inqTpCd": "2"},
         ]
 
     bond = [
@@ -237,31 +227,28 @@ def foreign_flows_2m():
         print("[KRX] 외인자금 전부 실패 → 지표 N/A")
         return None
     print(f"[KRX] 합산({'+'.join(got)}) 외인 2개월 누적: {total/1e12:+.2f}조")
-    return round(total / 1e12, 2)   # 조원
+    return round(total / 1e12, 2)
 
 
-# ── 3. 분석(트리거 판정 + 위기단계) ─────────────────────────────────
-def _stage_down(x, t1, t2):   # 낮을수록 위험
+# ── 3. 분석 ──────────────────────────────────────────────────────────
+def _stage_down(x, t1, t2):
     return 2 if x <= t2 else (1 if x <= t1 else 0)
 
 
-def _stage_up(x, t1, t2):     # 높을수록 위험
+def _stage_up(x, t1, t2):
     return 2 if x >= t2 else (1 if x >= t1 else 0)
 
 
-
-# ── ECOS: 직전 6개월 평균 자동계산(실패하면 설정값 사용) ───────────
 def ecos_six_month_avg():
     key = (os.environ.get("ECOS_KEY") or "").strip()
     if not key:
         print("[ECOS] 키 없음 → 6개월 평균은 설정값 사용")
         return {}
-    # 직전 6개 '완전한 달' (예: 6월 기준 → 12월 1일 ~ 5월 말일)
     today = dt.datetime.now(KST).date()
     first_this = today.replace(day=1)
-    end = first_this - dt.timedelta(days=1)                  # 전월 말일
-    m6 = first_this.year * 12 + (first_this.month - 1) - 6   # 6개월 전 월 인덱스
-    start = dt.date(m6 // 12, m6 % 12 + 1, 1)                # 그 달 1일
+    end = first_this - dt.timedelta(days=1)
+    m6 = first_this.year * 12 + (first_this.month - 1) - 6
+    start = dt.date(m6 // 12, m6 % 12 + 1, 1)
     s, e = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
     print(f"[ECOS] 직전6개월 구간: {s} ~ {e}")
     out = {}
@@ -342,21 +329,18 @@ def _strip_html(s):
 
 
 def news_window():
-    """수집 구간: 전(영업)일 07:11 ~ 금일 07:11 KST.
-       월요일 실행 시 시작점은 금요일 07:11(주말 기사 포함)."""
     h, m = NEWS_CUTOFF_HM
     now = dt.datetime.now(KST)
     end = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    if end > now:                      # 07:11 이전 실행이면 경계는 어제 07:11
+    if end > now:
         end -= dt.timedelta(days=1)
     start = end - dt.timedelta(days=1)
-    while start.weekday() >= 5:        # 토(5)·일(6)이면 금요일까지 소급
+    while start.weekday() >= 5:
         start -= dt.timedelta(days=1)
     return start, end
 
 
 def _in_window(items, start, end):
-    """구간 내 기사만; 한 건도 없으면 전체(최신순)를 그대로(빈 카드 방지)."""
     fresh = [x for x in items if x.get("date") and start <= x["date"] <= end]
     return fresh or items
 
@@ -366,9 +350,7 @@ def _tokens(title):
 
 
 def _cluster_coverage(articles):
-    """제목 유사 기사(=같은 사안을 여러 언론사가 보도)를 묶어
-       대표 1건만 남기고 보도량(coverage)을 기록. 화제성 근사치."""
-    clusters = []   # [{rep, toks, n}]
+    clusters = []
     for a in articles:
         t = _tokens(a["title"])
         hit = None
@@ -382,7 +364,7 @@ def _cluster_coverage(articles):
         if hit:
             hit["n"] += 1
             hit["toks"] |= t
-            if not hit["rep"].get("desc") and a.get("desc"):   # 요약감 있는 쪽을 대표로
+            if not hit["rep"].get("desc") and a.get("desc"):
                 a["keyword"] = hit["rep"].get("keyword", a.get("keyword"))
                 hit["rep"] = a
         else:
@@ -435,7 +417,6 @@ def _google_news(keyword, n, days=2):
 
 
 def _fetch_keyword(keyword, naver, n, start, end):
-    """네이버 우선, 실패/미설정 시 구글뉴스 RSS 폴백. 구간 내 기사 위주."""
     days = max(2, int((dt.datetime.now(KST) - start).total_seconds() // 86400) + 1)
     if naver:
         try:
@@ -472,7 +453,6 @@ def collect_news():
                 seen.add(key)
                 a["keyword"] = kw
                 articles.append(a)
-        # 같은 사안 묶기 → 보도량(coverage) 산출 후 보도량·최신순 정렬
         articles = _cluster_coverage(articles)
         articles.sort(key=lambda x: (x.get("coverage", 1),
                                      x.get("date") or dt.datetime.min.replace(tzinfo=KST)),
@@ -484,17 +464,13 @@ def collect_news():
     return groups
 
 
-# ── 3-C. 기사 선별 + 한 줄 요약 (Claude API · 1회 배치 호출) ─────────
+# ── 3-C. 기사 선별 + 한 줄 요약 ─────────────────────────────────────
 def _trim_groups(groups):
-    """AI 없이 쓰는 폴백: 보도량·최신순 상위 NEWS_PER_GROUP건만 남김."""
     for g in groups:
         g["articles"] = g["articles"][:NEWS_PER_GROUP]
 
 
 def curate_and_summarize(groups):
-    """그룹별 후보 중 화제성·중요도 상위 NEWS_PER_GROUP건을 AI가 선별하고
-       각각 'summary'(한 줄)·'press'(언론사 약칭)를 채운다.
-       ANTHROPIC_API_KEY 없거나 SDK 미설치/실패 시 보도량순 상위만 남김."""
     if not any(g["articles"] for g in groups):
         return
     if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
@@ -609,7 +585,6 @@ def _news_card(g, cid, has_img):
 
 
 def build_news_section(groups, date_label=""):
-    """매거진형 신문스크랩 섹션 HTML과 인라인 이미지(cid, 파일경로) 목록을 반환."""
     used = [g for g in (groups or []) if g.get("articles")]
     if not used:
         return "", []
@@ -717,9 +692,8 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
 
 # ── 5. 발송 ─────────────────────────────────────────────────────────
 def _attach_inline_images(root, html, images):
-    """cid 인라인 이미지 첨부. 발송 전 html의 cid를 고유 Content-ID로 치환."""
     for cid, path in images or []:
-        real = make_msgid(domain="fss.local")          # <...@fss.local>
+        real = make_msgid(domain="fss.local")
         html = html.replace(f"cid:{cid}", f"cid:{real[1:-1]}")
         try:
             with open(path, "rb") as f:
@@ -740,7 +714,6 @@ def send_email(subject, html, images=None):
         present = {k: ("있음" if os.environ.get(k) else "없음")
                    for k in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_TO")}
         print(f"[DRY-RUN] SMTP 미설정(상태: {present}) → 발송 대신 미리보기")
-        # 미리보기는 cid 대신 base64 data URI로 인라인 → 어디서 열어도 이미지 표시
         import base64
         for cid, path in images or []:
             try:
