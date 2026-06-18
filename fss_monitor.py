@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 FSS 일일 금융시장동향 → 통합 조기경보지표 일일 모니터링 → 메일 발송
-  지표(5): 주가(KOSPI) / 환율(원·달러) / 금리(국고3년) / ROK CDS / 신용스프레드
+  지표(6): 주가(KOSPI) / 환율(원·달러) / 금리(국고3년) / ROK CDS / 신용스프레드 / 외인자금(2개월 누적)
 
 트리거 기준
   주가  : 직전6개월 평균 대비  1단계 -10%,  2단계 -25%   (하락 위험)
   환율  : 직전6개월 평균 대비  1단계 +10%,  2단계 +25%   (상승 위험)
   금리  : 직전6개월 평균 대비  1단계 +60bp, 2단계 +120bp (상승 위험)
   ROK CDS / 신용스프레드 : 절대수준  1단계 100bp, 2단계 250bp
-종합결과 : 5개 중 2개 이상이 1단계↑ → 위기 1단계 / 2개 이상이 2단계 → 위기 2단계
+  외인자금(2개월 누적 순매수) : 1단계 -5조, 2단계 -7조 (이하·순유출 위험)
+종합결과 : 6개 중 2개 이상이 1단계↑ → 위기 1단계 / 2개 이상이 2단계 → 위기 2단계
 """
-import os, re, ssl, sys, json, smtplib
+import os, re, ssl, sys, json, smtplib, calendar
 import html as html_lib
 import urllib.parse
 import datetime as dt
@@ -39,6 +40,11 @@ ECOS_SERIES = {
 
 ABS_TRIGGER  = (100, 250)   # CDS·스프레드 절대수준(bp) 1단계/2단계
 CRISIS_COUNT = 2            # N개 이상 지표 진입 시 위기 선포
+
+# 외인 투자자금 2개월 누적 순매수 트리거(조원). 순유출(음수)이 클수록 위험.
+#   1단계 -5조 이하, 2단계 -7조 이하 진입 시 발동.
+FOREIGN_TRIGGER = (-5.0, -7.0)
+KRX_API = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 
 LOOKBACK = 7
 API = "https://www.fss.or.kr/fss/kr/openApi/api/fnncMrkt.jsp"
@@ -133,6 +139,69 @@ def extract(pdf_io):
     return v
 
 
+# ── 2-B. KRX: 외인 투자자금 2개월 누적 순매수(코스피+코스닥+채권) ────
+def _krx_investor_net(bld, params):
+    """KRX 투자자별 거래실적(기간합계)에서 외국인 순매수(원) 반환. 실패 시 None.
+       응답 필드명/화면(bld) 코드는 KRX 개편 시 바뀔 수 있어 다수 후보로 파싱."""
+    base = {"locale": "ko_KR", "inqTpCd": "2", "trdVolVal": "2",
+            "askBid": "3", "money": "1", "csvxls_isNo": "false"}
+    base.update(params)
+    base["bld"] = bld
+    headers = {"User-Agent": UA, "Referer": "http://data.krx.co.kr/"}
+    r = requests.post(KRX_API, data=base, headers=headers, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    rows = j.get("output") or j.get("block1") or j.get("OutBlock_1") or []
+    for row in rows:
+        name = (row.get("INVST_TP_NM") or row.get("INVST_TP") or
+                row.get("INVSTTP_NM") or "").replace(" ", "")
+        if "외국인" in name and "기타" not in name:
+            for k in ("NETBYACC_TRDVAL", "NETBYACC", "TRDVAL",
+                      "NETBYVAL", "ACC_TRDVAL"):
+                val = row.get(k)
+                if val not in (None, "", "-"):
+                    return float(str(val).replace(",", ""))
+    print(f"[KRX] 외국인 행/필드 미발견(bld={bld}). 샘플={rows[:2]}")
+    return None
+
+
+def foreign_flows_2m():
+    """어제 기준 직전 2개월 외인 순매수 누적(코스피+코스닥+채권) 합산 → 조원.
+       일부/전부 실패 시 가능한 만큼 합산하고 진단 로그 출력. 전부 실패면 None."""
+    today = dt.datetime.now(KST).date()
+    end = today - dt.timedelta(days=1)
+    y, mo = end.year, end.month - 2
+    if mo <= 0:
+        mo += 12
+        y -= 1
+    day = min(end.day, calendar.monthrange(y, mo)[1])
+    start = dt.date(y, mo, day)
+    s, e = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    print(f"[KRX] 외인 2개월 구간: {s} ~ {e}")
+    sources = [
+        ("코스피", "dbms/MDC/STAT/standard/MDCSTAT02203", {"mktId": "STK", "strtDd": s, "endDd": e}),
+        ("코스닥", "dbms/MDC/STAT/standard/MDCSTAT02203", {"mktId": "KSQ", "strtDd": s, "endDd": e}),
+        ("채권",   "dbms/MDC/STAT/standard/MDCSTAT11001", {"strtDd": s, "endDd": e}),
+    ]
+    total, got = 0.0, []
+    for label, bld, params in sources:
+        try:
+            v = _krx_investor_net(bld, params)
+            if v is None:
+                print(f"[KRX] {label} 외국인 순매수 파싱 실패 → 합산 제외")
+                continue
+            total += v
+            got.append(label)
+            print(f"[KRX] {label} 외국인 순매수: {v/1e12:+.2f}조")
+        except Exception as ex:
+            print(f"[KRX] {label} 실패 → 합산 제외: {ex}")
+    if not got:
+        print("[KRX] 외인자금 전부 실패 → 지표 N/A")
+        return None
+    print(f"[KRX] 합산({'+'.join(got)}) 외인 2개월 누적: {total/1e12:+.2f}조")
+    return round(total / 1e12, 2)   # 조원
+
+
 # ── 3. 분석(트리거 판정 + 위기단계) ─────────────────────────────────
 def _stage_down(x, t1, t2):   # 낮을수록 위험
     return 2 if x <= t2 else (1 if x <= t1 else 0)
@@ -178,7 +247,7 @@ def ecos_six_month_avg():
     return out
 
 
-def analyze(d, avg=None):
+def analyze(d, avg=None, foreign_2m=None):
     a = {**SIX_MONTH_AVG, **(avg or {})}
     rows = []
 
@@ -207,6 +276,17 @@ def analyze(d, avg=None):
     rows.append({"name": "신용스프레드 (회사채3년AA- − 국고3년)", "short": "신용스프레드", "unit": "bp",
                  "t1": f"{a1}", "t2": f"{a2}", "val": f"{d['spread']:.0f}",
                  "stage": _stage_up(d["spread"], a1, a2), "sub": None})
+
+    f1, f2 = FOREIGN_TRIGGER
+    if foreign_2m is None:
+        rows.append({"name": "외인 순매수 (2개월 누적·코스피·코스닥·채권)", "short": "외인자금",
+                     "unit": "조원", "t1": f"{f1:.0f}", "t2": f"{f2:.0f}",
+                     "val": "N/A", "stage": 0, "sub": None})
+    else:
+        rows.append({"name": "외인 순매수 (2개월 누적·코스피·코스닥·채권)", "short": "외인자금",
+                     "unit": "조원", "t1": f"{f1:.0f}", "t2": f"{f2:.0f}",
+                     "val": f"{foreign_2m:+.2f}",
+                     "stage": _stage_down(foreign_2m, f1, f2), "sub": None})
 
     n1 = sum(1 for r in rows if r["stage"] >= 1)
     n2 = sum(1 for r in rows if r["stage"] == 2)
@@ -586,10 +666,11 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
     </table>
     <div style="margin:14px 0 4px;font-size:11px;color:#9aa;line-height:1.6">
       트리거 — 주가: 6개월평균 대비 1단계 −10%/2단계 −25% · 환율: +10%/+25% ·
-      금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp<br>
+      금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp · 외인자금: 2개월누적 −5조/−7조<br>
       종합결과 — 2개 이상 지표가 1단계↑ 진입 시 위기 1단계, 2개 이상 2단계 진입 시 위기 2단계 ·
       기준 초과는 <span style="color:#c0392b">빨간색</span> 표시<br>
-      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 출처: 금융감독원 금융시장안정국. 정확성 보장하지 않음.
+      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 KRX 투자자별 거래실적(어제 기준 직전 2개월 누적) ·
+      출처: 금융감독원 금융시장안정국·한국거래소. 정확성 보장하지 않음.
     </div>
   </div>
   {news_html}
@@ -660,7 +741,12 @@ def main():
         url, reg = fetch_daily_pdf_url(os.environ["FSS_AUTH_KEY"])
         print("PDF:", url, "| 게시:", reg)
         avg = {**SIX_MONTH_AVG, **ecos_six_month_avg()}
-        an = analyze(extract(download_pdf(url)), avg)
+        ff = None
+        try:
+            ff = foreign_flows_2m()
+        except Exception as ex:
+            print("[KRX] 외인자금 수집 실패 → 지표 N/A:", ex)
+        an = analyze(extract(download_pdf(url)), avg, foreign_2m=ff)
         print("결과:", an["result"], "|", an["summary"])
         news_html, news_images = "", []
         try:
