@@ -130,13 +130,16 @@ def extract(pdf_io):
 
 # ── 2-B. KRX: 외인 투자자금 2개월 누적 순매수 ───────────────────────
 def _krx_post(data):
-    """KRX 인증키가 있으면 AUTH_KEY 파라미터를 추가해 인증 요청."""
+    """KRX getJsonData 호출. 인증키(KRX_AUTH_KEY)는 헤더로 전달(있을 때만).
+       HTTP 오류 시 응답 본문 앞부분을 로그로 남겨 원인 진단."""
     krx_key = (os.environ.get("KRX_AUTH_KEY") or "").strip()
-    if krx_key:
-        data = {**data, "AUTH_KEY": krx_key}
     headers = {"User-Agent": UA, "Referer": "http://data.krx.co.kr/",
                "X-Requested-With": "XMLHttpRequest"}
+    if krx_key:
+        headers["AUTH_KEY"] = krx_key
     r = requests.post(KRX_API, data=data, headers=headers, timeout=30)
+    if r.status_code >= 400:
+        print(f"[KRX] HTTP {r.status_code} (bld={data.get('bld')}) 응답={r.text[:200]}")
     r.raise_for_status()
     return r.json()
 
@@ -195,20 +198,17 @@ def foreign_flows_2m():
     print(f"[KRX] 외인 2개월 구간: {s} ~ {e}")
 
     def stock(mkt):
-        base = {"mktId": mkt, "strtDd": s, "endDd": e,
-                "share": "1", "money": "1", "csvxls_isNo": "false"}
-        return [
-            {**base, "bld": "dbms/MDC/STAT/standard/MDCSTAT02401", "inqTpCd": "2"},
-            {**base, "bld": "dbms/MDC/STAT/standard/MDCSTAT02401"},
-            {**base, "bld": "dbms/MDC/STAT/standard/MDCSTAT02203", "inqTpCd": "2"},
-        ]
+        # locale 필수! 없으면 getJsonData 400. 시장전체 투자자별 거래실적(기간합계).
+        base = {"locale": "ko_KR", "mktId": mkt, "invstTpCd": "",
+                "strtDd": s, "endDd": e, "share": "1", "money": "1",
+                "csvxls_isNo": "false"}
+        blds = ["MDCSTAT02401", "MDCSTAT02403", "MDCSTAT02203"]
+        return [{**base, "bld": f"dbms/MDC/STAT/standard/{b}"} for b in blds]
 
-    bond = [
-        {"bld": "dbms/MDC/STAT/standard/MDCSTAT11001", "strtDd": s, "endDd": e,
-         "money": "1", "csvxls_isNo": "false"},
-        {"bld": "dbms/MDC/STAT/standard/MDCSTAT11002", "strtDd": s, "endDd": e,
-         "money": "1", "csvxls_isNo": "false"},
-    ]
+    bond = [{"locale": "ko_KR", "bld": f"dbms/MDC/STAT/standard/{b}",
+             "strtDd": s, "endDd": e, "share": "2", "money": "3",
+             "csvxls_isNo": "false"}
+            for b in ("MDCSTAT11001", "MDCSTAT11002", "MDCSTAT11003")]
 
     sources = [("코스피", stock("STK")), ("코스닥", stock("KSQ")), ("채권", bond)]
     total, got = 0.0, []
