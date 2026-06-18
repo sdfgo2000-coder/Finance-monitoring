@@ -1,0 +1,39 @@
+name: FSS Daily Market Monitor
+
+on:
+  # 정시 발송은 외부 스케줄러(cron-job.org 등)가 매일 07:11 KST(평일)에
+  # workflow_dispatch API를 호출해 트리거함. GitHub 자체 cron은 정시·누락이
+  # 불안정해 사용하지 않음. 아래는 수동/외부 트리거용.
+  workflow_dispatch: {}
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor & send email
+        env:
+          FSS_AUTH_KEY: ${{ secrets.FSS_AUTH_KEY }}
+          ECOS_KEY:     ${{ secrets.ECOS_KEY }}
+          SMTP_HOST:    ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:    ${{ secrets.SMTP_PORT }}
+          SMTP_USER:    ${{ secrets.SMTP_USER }}
+          SMTP_PASS:    ${{ secrets.SMTP_PASS }}
+          MAIL_TO:      ${{ secrets.MAIL_TO }}
+          MAIL_FROM:    ${{ secrets.MAIL_FROM }}
+          # 삼성 계열사 신문스크랩 — 미설정 시 구글뉴스 RSS로 자동 폴백
+          NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          # 기사 한 줄 요약(AI) — 미설정 시 제목만 표시
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          # 요약 모델 — 비용 절감용 haiku(기본 opus). 바꾸려면 이 값만 수정
+          NEWS_SUMMARY_MODEL:  claude-haiku-4-5
+        run: python fss_monitor.py
