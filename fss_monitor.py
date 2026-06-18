@@ -394,19 +394,37 @@ def curate_and_summarize(groups):
                                 "desc": (a.get("desc") or "")[:200]}
                                for i, a in enumerate(g["articles"])]}
                for gi, g in enumerate(groups) if g["articles"]]
-    schema = {"type": "object", "additionalProperties": False,
-              "required": ["groups"],
-              "properties": {"groups": {"type": "array", "items": {
-                  "type": "object", "additionalProperties": False,
-                  "required": ["g", "picks"],
-                  "properties": {
-                      "g": {"type": "integer"},
-                      "picks": {"type": "array", "items": {
-                          "type": "object", "additionalProperties": False,
-                          "required": ["i", "summary", "press"],
-                          "properties": {"i": {"type": "integer"},
-                                         "summary": {"type": "string"},
-                                         "press": {"type": "string"}}}}}}}}}
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["groups"],
+        "properties": {
+            "groups": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["g", "picks"],
+                    "properties": {
+                        "g": {"type": "integer"},
+                        "picks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["i", "summary", "press"],
+                                "properties": {
+                                    "i": {"type": "integer"},
+                                    "summary": {"type": "string"},
+                                    "press": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
     system = (f"너는 삼성그룹 계열사 신문스크랩을 만드는 한국어 편집기자다. "
               f"각 그룹의 후보 기사 중 독자가 가장 많이 볼 만한(화제성 높은) 기사를 "
               f"중요한 순서대로 최대 {NEWS_PER_GROUP}건 고른다. 판단 기준: "
