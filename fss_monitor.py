@@ -139,32 +139,84 @@ def _krx_post(data):
         headers["AUTH_KEY"] = krx_key
     r = requests.post(KRX_API, data=data, headers=headers, timeout=30)
     if r.status_code >= 400:
-        print(f"[KRX] HTTP {r.status_code} (bld={data.get('bld')}) 응답={r.text[:200]}")
+        print(f"[KRX] HTTP {r.status_code} (bld={data.get('bld')}) 응답={r.text[:300]}")
     r.raise_for_status()
     return r.json()
 
 
-def _pick_foreign_net(rows):
-    """투자자별 거래실적 행에서 외국인 순매수 거래대금(원) 합산 반환."""
+def _pick_foreign_stock_net(rows):
+    """주식 투자자별 거래실적: 외국인 순매수금액(원) 반환.
+       순매수 = 매수금액 - 매도금액"""
     NET_FIELDS = ("NETBID_TRDVAL", "NETBID_TRDVAL_AGG", "NETBYACC_TRDVAL",
-                  "NET_TRDVAL", "NETBYVAL", "TRDVAL", "NETBYACC", "NETBID")
+                  "NET_TRDVAL", "NETBYVAL", "NETBYACC", "NETBID")
+    BUY_FIELDS = ("BUY_TRDVAL", "BUYVAL", "BIDVAL", "ACMBID_TRDVAL")
+    SEL_FIELDS = ("SELL_TRDVAL", "SELLVAL", "OFFERVAL", "ACMOFFER_TRDVAL")
     total, found = 0.0, False
     for row in rows:
         name = (row.get("INVST_TP_NM") or row.get("INVST_TP") or
                 row.get("INVSTTP_NM") or row.get("INVST_NM") or "").replace(" ", "")
         if "외국인" not in name:
             continue
+        # 순매수 필드 직접 사용
         for k in NET_FIELDS:
             val = row.get(k)
             if val not in (None, "", "-"):
                 total += float(str(val).replace(",", ""))
                 found = True
                 break
+        else:
+            # 순매수 필드 없으면 매수 - 매도 계산
+            buy = next((float(str(row[k]).replace(",", "")) for k in BUY_FIELDS
+                        if row.get(k) not in (None, "", "-")), None)
+            sel = next((float(str(row[k]).replace(",", "")) for k in SEL_FIELDS
+                        if row.get(k) not in (None, "", "-")), None)
+            if buy is not None and sel is not None:
+                total += buy - sel
+                found = True
     return total if found else None
 
 
-def _krx_investor_net(candidates):
-    """후보 파라미터셋을 순서대로 시도, 외국인 순매수 합(원) 반환."""
+def _pick_foreign_bond_net(rows):
+    """채권 외국인 순유입 = 매수금액 - 매도금액 - 상환원금 (계약시점 기준)."""
+    # KRX MDCSTAT110xx 응답 필드 후보
+    BUY_FIELDS  = ("BUY_TRDVAL",  "BUYVAL",  "FRGN_BUY_TRDVAL",  "FRGN_BUYVAL")
+    SEL_FIELDS  = ("SELL_TRDVAL", "SELLVAL", "FRGN_SELL_TRDVAL", "FRGN_SELLVAL")
+    RPL_FIELDS  = ("RPLM_TRDVAL", "RPLMVAL", "RPYM_TRDVAL",      "RPYMVAL",
+                   "REPAY_TRDVAL", "REPAYVAL", "MTRT_TRDVAL",    "MTRTVAL")
+    # 순유입 통합 필드(있으면 우선 사용)
+    NET_FIELDS  = ("NET_TRDVAL", "NETVAL", "NETBID_TRDVAL", "FRGN_NET_TRDVAL")
+
+    total, found = 0.0, False
+    for row in rows:
+        name = (row.get("INVST_TP_NM") or row.get("INVST_TP") or
+                row.get("INVSTTP_NM") or row.get("INVST_NM") or "").replace(" ", "")
+        # 채권 API는 외국인 행이 없고 전체 집계만 있는 경우도 있음 → 전체도 허용
+        is_foreign = ("외국인" in name or "외국" in name or name == "")
+        if not is_foreign:
+            continue
+        # 순유입 통합 필드 우선
+        net_val = next((float(str(row[k]).replace(",", "")) for k in NET_FIELDS
+                        if row.get(k) not in (None, "", "-")), None)
+        if net_val is not None:
+            total += net_val
+            found = True
+            continue
+        # 매수 - 매도 - 상환원금
+        buy = next((float(str(row[k]).replace(",", "")) for k in BUY_FIELDS
+                    if row.get(k) not in (None, "", "-")), None)
+        sel = next((float(str(row[k]).replace(",", "")) for k in SEL_FIELDS
+                    if row.get(k) not in (None, "", "-")), None)
+        rpl = next((float(str(row[k]).replace(",", "")) for k in RPL_FIELDS
+                    if row.get(k) not in (None, "", "-")), 0.0)
+        if buy is not None and sel is not None:
+            total += buy - sel - rpl
+            found = True
+    return total if found else None
+
+
+def _krx_investor_net(candidates, is_bond=False):
+    """후보 파라미터셋을 순서대로 시도, 외국인 순매수/순유입(원) 반환."""
+    pick_fn = _pick_foreign_bond_net if is_bond else _pick_foreign_stock_net
     last = None
     for data in candidates:
         try:
@@ -175,7 +227,7 @@ def _krx_investor_net(candidates):
         rows = j.get("output") or j.get("block1") or j.get("OutBlock_1") or []
         if not rows:
             continue
-        net = _pick_foreign_net(rows)
+        net = pick_fn(rows)
         if net is not None:
             return net
         print(f"[KRX] 외국인 행/필드 미발견(bld={data.get('bld')}). 샘플={rows[:1]}")
@@ -185,7 +237,11 @@ def _krx_investor_net(candidates):
 
 
 def foreign_flows_2m():
-    """어제 기준 직전 2개월 외인 순매수 누적(코스피+코스닥+채권) → 조원."""
+    """어제 기준 직전 2개월 외인 순매수 누적.
+       주식(코스피+코스닥): 일별 외국인 순매수 합산
+       채권: 일별 외국인 매수금액 - 매도금액 - 상환원금 (계약시점 기준)
+       반환값: 조원 단위 float, 실패 시 None
+    """
     today = dt.datetime.now(KST).date()
     end = today - dt.timedelta(days=1)
     y, mo = end.year, end.month - 2
@@ -198,29 +254,34 @@ def foreign_flows_2m():
     print(f"[KRX] 외인 2개월 구간: {s} ~ {e}")
 
     def stock(mkt):
-        # locale 필수! 없으면 getJsonData 400. 시장전체 투자자별 거래실적(기간합계).
+        # locale 필수 — 없으면 400. 기간합계 투자자별 거래실적.
         base = {"locale": "ko_KR", "mktId": mkt, "invstTpCd": "",
                 "strtDd": s, "endDd": e, "share": "1", "money": "1",
                 "csvxls_isNo": "false"}
         blds = ["MDCSTAT02401", "MDCSTAT02403", "MDCSTAT02203"]
         return [{**base, "bld": f"dbms/MDC/STAT/standard/{b}"} for b in blds]
 
+    # 채권 외국인 투자자 거래 (계약시점 기준)
     bond = [{"locale": "ko_KR", "bld": f"dbms/MDC/STAT/standard/{b}",
              "strtDd": s, "endDd": e, "share": "2", "money": "3",
              "csvxls_isNo": "false"}
             for b in ("MDCSTAT11001", "MDCSTAT11002", "MDCSTAT11003")]
 
-    sources = [("코스피", stock("STK")), ("코스닥", stock("KSQ")), ("채권", bond)]
+    sources = [
+        ("코스피", stock("STK"), False),
+        ("코스닥", stock("KSQ"), False),
+        ("채권",   bond,         True),
+    ]
     total, got = 0.0, []
-    for label, cands in sources:
+    for label, cands, is_bond in sources:
         try:
-            v = _krx_investor_net(cands)
+            v = _krx_investor_net(cands, is_bond=is_bond)
             if v is None:
                 print(f"[KRX] {label} 외국인 순매수 파싱 실패 → 합산 제외")
                 continue
             total += v
             got.append(label)
-            print(f"[KRX] {label} 외국인 순매수: {v/1e12:+.2f}조")
+            print(f"[KRX] {label} 외국인 순{'유입' if is_bond else '매수'}: {v/1e12:+.2f}조")
         except Exception as ex:
             print(f"[KRX] {label} 실패 → 합산 제외: {ex}")
     if not got:
@@ -682,7 +743,8 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
       금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp · 외인자금: 2개월누적 −5조/−7조<br>
       종합결과 — 2개 이상 지표가 1단계↑ 진입 시 위기 1단계, 2개 이상 2단계 진입 시 위기 2단계 ·
       기준 초과는 <span style="color:#c0392b">빨간색</span> 표시<br>
-      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 KRX 투자자별 거래실적(어제 기준 직전 2개월 누적) ·
+      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 KRX 투자자별 거래실적(어제 기준 직전 2개월 누적,
+      주식: 순매수, 채권: 매수-매도-상환원금, 계약시점 기준) ·
       출처: 금융감독원 금융시장안정국·한국거래소. 정확성 보장하지 않음.
     </div>
   </div>
