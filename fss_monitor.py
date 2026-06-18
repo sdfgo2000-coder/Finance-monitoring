@@ -24,7 +24,7 @@ from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr, parsedate_to_datetime, make_msgid
 import requests, pdfplumber
 
-# ── 설정 ────────────────────────────────────────────────────────────
+# ── 설정 ─────────────────────────────────────────────────────────────
 # 직전 6개월 평균(설정값) — FSS 일일 PDF엔 6개월 시계열이 없어 여기서 관리.
 # 월 1회 정도 갱신하세요. (추후 ECOS 연동 시 자동화 가능)
 SIX_MONTH_AVG = {"kospi": 5574, "fx": 1473, "ktb3": 3.27}
@@ -140,28 +140,52 @@ def extract(pdf_io):
 
 
 # ── 2-B. KRX: 외인 투자자금 2개월 누적 순매수(코스피+코스닥+채권) ────
-def _krx_investor_net(bld, params):
-    """KRX 투자자별 거래실적(기간합계)에서 외국인 순매수(원) 반환. 실패 시 None.
-       응답 필드명/화면(bld) 코드는 KRX 개편 시 바뀔 수 있어 다수 후보로 파싱."""
-    base = {"locale": "ko_KR", "inqTpCd": "2", "trdVolVal": "2",
-            "askBid": "3", "money": "1", "csvxls_isNo": "false"}
-    base.update(params)
-    base["bld"] = bld
-    headers = {"User-Agent": UA, "Referer": "http://data.krx.co.kr/"}
-    r = requests.post(KRX_API, data=base, headers=headers, timeout=30)
+def _krx_post(data):
+    headers = {"User-Agent": UA, "Referer": "http://data.krx.co.kr/",
+               "X-Requested-With": "XMLHttpRequest"}
+    r = requests.post(KRX_API, data=data, headers=headers, timeout=30)
     r.raise_for_status()
-    j = r.json()
-    rows = j.get("output") or j.get("block1") or j.get("OutBlock_1") or []
+    return r.json()
+
+
+def _pick_foreign_net(rows):
+    """투자자별 거래실적 행에서 외국인(외국인+기타외국인) 순매수 거래대금(원) 합산 반환.
+       순매수 필드명은 KRX 화면마다 달라 다수 후보로 파싱. 미발견 시 None."""
+    NET_FIELDS = ("NETBID_TRDVAL", "NETBID_TRDVAL_AGG", "NETBYACC_TRDVAL",
+                  "NET_TRDVAL", "NETBYVAL", "TRDVAL", "NETBYACC", "NETBID")
+    total, found = 0.0, False
     for row in rows:
         name = (row.get("INVST_TP_NM") or row.get("INVST_TP") or
-                row.get("INVSTTP_NM") or "").replace(" ", "")
-        if "외국인" in name and "기타" not in name:
-            for k in ("NETBYACC_TRDVAL", "NETBYACC", "TRDVAL",
-                      "NETBYVAL", "ACC_TRDVAL"):
-                val = row.get(k)
-                if val not in (None, "", "-"):
-                    return float(str(val).replace(",", ""))
-    print(f"[KRX] 외국인 행/필드 미발견(bld={bld}). 샘플={rows[:2]}")
+                row.get("INVSTTP_NM") or row.get("INVST_NM") or "").replace(" ", "")
+        if "외국인" not in name:
+            continue
+        for k in NET_FIELDS:
+            val = row.get(k)
+            if val not in (None, "", "-"):
+                total += float(str(val).replace(",", ""))
+                found = True
+                break
+    return total if found else None
+
+
+def _krx_investor_net(candidates):
+    """후보 파라미터셋을 순서대로 시도, 행이 있는 응답에서 외국인 순매수 합(원) 반환."""
+    last = None
+    for data in candidates:
+        try:
+            j = _krx_post(data)
+        except Exception as ex:
+            last = ex
+            continue
+        rows = j.get("output") or j.get("block1") or j.get("OutBlock_1") or []
+        if not rows:
+            continue
+        net = _pick_foreign_net(rows)
+        if net is not None:
+            return net
+        print(f"[KRX] 외국인 행/필드 미발견(bld={data.get('bld')}). 샘플={rows[:1]}")
+    if last:
+        raise last
     return None
 
 
@@ -178,15 +202,29 @@ def foreign_flows_2m():
     start = dt.date(y, mo, day)
     s, e = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
     print(f"[KRX] 외인 2개월 구간: {s} ~ {e}")
-    sources = [
-        ("코스피", "dbms/MDC/STAT/standard/MDCSTAT02203", {"mktId": "STK", "strtDd": s, "endDd": e}),
-        ("코스닥", "dbms/MDC/STAT/standard/MDCSTAT02203", {"mktId": "KSQ", "strtDd": s, "endDd": e}),
-        ("채권",   "dbms/MDC/STAT/standard/MDCSTAT11001", {"strtDd": s, "endDd": e}),
+
+    def stock(mkt):
+        # [12009] 투자자별 거래실적(시장전체, 기간합계) = MDCSTAT02401
+        common = {"mktId": mkt, "strtDd": s, "endDd": e,
+                  "share": "1", "money": "1", "csvxls_isNo": "false"}
+        return [
+            {**common, "bld": "dbms/MDC/STAT/standard/MDCSTAT02401", "inqTpCd": "2"},
+            {**common, "bld": "dbms/MDC/STAT/standard/MDCSTAT02401"},
+            {**common, "bld": "dbms/MDC/STAT/standard/MDCSTAT02203", "inqTpCd": "2"},
+        ]
+
+    bond = [
+        {"bld": "dbms/MDC/STAT/standard/MDCSTAT11001", "strtDd": s, "endDd": e,
+         "money": "1", "csvxls_isNo": "false"},
+        {"bld": "dbms/MDC/STAT/standard/MDCSTAT11002", "strtDd": s, "endDd": e,
+         "money": "1", "csvxls_isNo": "false"},
     ]
+
+    sources = [("코스피", stock("STK")), ("코스닥", stock("KSQ")), ("채권", bond)]
     total, got = 0.0, []
-    for label, bld, params in sources:
+    for label, cands in sources:
         try:
-            v = _krx_investor_net(bld, params)
+            v = _krx_investor_net(cands)
             if v is None:
                 print(f"[KRX] {label} 외국인 순매수 파싱 실패 → 합산 제외")
                 continue
