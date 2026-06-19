@@ -127,173 +127,112 @@ def extract(pdf_io):
     return v
 
 
-# ── 2-B. 외인 투자자금: 네이버금융(주식) + KOFIA(채권) ────────────────
-def _naver_day_net(day, sosok):
-    """네이버금융 특정일 외국인 순매수(억원). 휴장일=0, 실패=None.
-    sosok: 0=코스피, 1=코스닥
-    단위: 억원 (1억원 = 100,000,000원)
-    """
-    url = ("https://finance.naver.com/sise/investorDealTrendDay.naver"
-           f"?bizdate={day.strftime('%Y%m%d')}&sosok={sosok}")
+# ── 2-B. 외인 투자자금: KRX HTTPS API ────────────────────────────────
+KRX_BASE = "https://data.krx.co.kr"
+KRX_JSON = KRX_BASE + "/comm/bldAttendant/getJsonData.cmd"
+
+
+def _krx_session():
+    """KRX 세션 쿠키 획득. requests.Session 반환."""
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Origin": KRX_BASE,
+    })
+    # JS 쿠키 수동 설정
+    sess.cookies.set("mdc.client_session", "true", domain="data.krx.co.kr")
+    # 세션 워밍업 (JSESSIONID 획득)
     try:
-        r = requests.get(url,
-                         headers={"User-Agent": UA,
-                                  "Referer": "https://finance.naver.com/"},
-                         timeout=15)
-    except Exception:
+        warmup_url = KRX_BASE + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020301"
+        sess.get(warmup_url, timeout=20)
+    except Exception as ex:
+        print(f"[KRX] 세션 워밍업 실패(무시): {ex}")
+    return sess
+
+
+def _krx_stock_2m(start, end):
+    """KRX 주식(코스피+코스닥) 외국인 순매수 2개월 누적(원). 실패 시 None."""
+    sess = _krx_session()
+    payload = {
+        "bld": "dbms/MDC/STAT/standard/MDCSTAT02201",
+        "locale": "ko_KR",
+        "inqTpCd": "1",      # 기간별
+        "trdVolVal": "2",    # 거래대금
+        "askBid": "3",       # 순매수
+        "mktId": "ALL",      # 코스피+코스닥
+        "strtDd": start.strftime("%Y%m%d"),
+        "endDd": end.strftime("%Y%m%d"),
+        "share": "2",
+        "money": "3",
+        "csvxls_isNo": "false",
+    }
+    headers = {
+        "Referer": KRX_BASE + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020301",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    try:
+        r = sess.post(KRX_JSON, data=payload, headers=headers, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        rows = j.get("output") or []
+        for row in rows:
+            name = (row.get("INVST_TP_NM") or "").replace(" ", "")
+            if "외국인" in name:
+                raw = str(row.get("NETBID_TRDVAL", "")).replace(",", "")
+                val = float(raw)
+                print(f"[KRX 주식] 외국인 순매수 {start}~{end}: {val/1e12:+.2f}조")
+                return val  # 원 단위
+        print(f"[KRX 주식] 외국인 행 미발견. 행수={len(rows)}, 샘플={rows[:1]}")
         return None
-    if r.status_code != 200:
+    except Exception as ex:
+        print(f"[KRX 주식] 오류: {ex}")
         return None
 
-    html = r.content.decode("euc-kr", errors="replace")
 
-    # 휴장일 판별
-    if ("데이터가 없습니다" in html or "조회된 내용이 없습니다" in html
-            or "해당일은 개장일이 아닙니다" in html):
-        return 0
-
-    # 외국인 행 위치 찾기
-    pos = html.find("외국인")
-    if pos < 0:
+def _krx_bond_2m(start, end):
+    """KRX 채권 외국인 순매수(매수-매도) 2개월 누적(원). 실패 시 None."""
+    sess = _krx_session()
+    payload = {
+        "bld": "dbms/MDC/STAT/standard/MDCSTAT11001",
+        "locale": "ko_KR",
+        "inqTpCd": "1",
+        "trdVolVal": "2",
+        "askBid": "3",
+        "strtDd": start.strftime("%Y%m%d"),
+        "endDd": end.strftime("%Y%m%d"),
+        "share": "2",
+        "money": "3",
+        "csvxls_isNo": "false",
+    }
+    headers = {
+        "Referer": KRX_BASE + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0204010100",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    try:
+        r = sess.post(KRX_JSON, data=payload, headers=headers, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        rows = j.get("output") or []
+        for row in rows:
+            name = (row.get("INVST_TP_NM") or "").replace(" ", "")
+            if "외국인" in name:
+                raw = str(row.get("NETBID_TRDVAL", "")).replace(",", "")
+                val = float(raw)
+                print(f"[KRX 채권] 외국인 순매수 {start}~{end}: {val/1e12:+.2f}조")
+                return val  # 원 단위
+        print(f"[KRX 채권] 외국인 행 미발견. 행수={len(rows)}, 샘플={rows[:1]}")
         return None
-
-    # 외국인 이후 500자에서 숫자 추출
-    # 네이버금융 테이블: 외국인 | 매도금액 | 매수금액 | 순매수금액
-    chunk = html[pos:pos + 500]
-
-    # <td> 안의 숫자 (음수 포함, 쉼표 포함)
-    nums = re.findall(r'<td[^>]*>\s*(-?[\d,]+)\s*</td>', chunk)
-    if len(nums) >= 3:
-        try:
-            return float(nums[2].replace(",", ""))  # 3번째 = 순매수
-        except ValueError:
-            pass
-
-    # 폴백: span 등으로 감싸진 경우
-    nums2 = re.findall(r'>\s*(-?[\d,]+)\s*<', chunk)
-    # 숫자가 3개 이상이어야 의미있음
-    numeric = []
-    for n in nums2:
-        clean = n.replace(",", "")
-        if re.fullmatch(r"-?\d+", clean) and len(clean) >= 2:
-            numeric.append(float(clean))
-        if len(numeric) >= 3:
-            break
-    if len(numeric) >= 3:
-        return numeric[2]  # 3번째 = 순매수
-
-    return None
-
-
-def _naver_stock_2m(label, sosok, start, end):
-    """네이버금융 2개월 외국인 순매수 누적(억원). 실패 비율 높으면 None 반환."""
-    d = start
-    total, ok_cnt, fail_cnt = 0.0, 0, 0
-    while d <= end:
-        if d.weekday() < 5:  # 평일만
-            net = _naver_day_net(d, sosok)
-            if net is None:
-                fail_cnt += 1
-            else:
-                total += net
-                ok_cnt += 1
-            time.sleep(0.3)  # 네이버 서버 부하 방지
-        d += dt.timedelta(days=1)
-
-    total_days = ok_cnt + fail_cnt
-    if total_days == 0:
+    except Exception as ex:
+        print(f"[KRX 채권] 오류(비필수): {ex}")
         return None
-    fail_rate = fail_cnt / total_days
-    print(f"[네이버] {label}: {ok_cnt}일 수집, {fail_cnt}일 실패(실패율={fail_rate:.0%}), "
-          f"누적순매수={total/10000:+.2f}조")
-    if fail_rate > 0.5:  # 절반 이상 실패 시 신뢰 불가
-        print(f"[네이버] {label} 실패율 과다 → 제외")
-        return None
-    return total  # 억원
-
-
-def _kofia_bond_2m(start, end):
-    """KOFIA 장외채권 외국인 순유입 2개월 누적(억원).
-    계산: 매수금액 - 매도금액 - 상환원금 (계약시점 기준)
-    실패 시 None 반환.
-    """
-    s, e = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-
-    # KOFIA freeboard 통계 API 시도
-    endpoints = [
-        {
-            "url": "http://freeboard.kofia.or.kr/stat/retrieveKofiaFRStatData.do",
-            "data": {"sche_num": "1000250", "fr_dt": s, "to_dt": e, "period_gubun": "D"},
-        },
-        {
-            "url": "http://freeboard.kofia.or.kr/data/CP03020200.do",
-            "data": {"sche_num": "1000250", "fr_dt": s, "to_dt": e},
-        },
-    ]
-    headers = {"User-Agent": UA, "Referer": "http://freeboard.kofia.or.kr/",
-               "X-Requested-With": "XMLHttpRequest"}
-
-    for ep in endpoints:
-        try:
-            r = requests.post(ep["url"], data=ep["data"], headers=headers, timeout=30)
-            if r.status_code != 200:
-                print(f"[KOFIA] {ep['url']} → HTTP {r.status_code}")
-                continue
-            j = r.json()
-            # 응답 구조 탐색: 외국인 행 찾기
-            rows = (j.get("output") or j.get("data") or j.get("rows") or
-                    j.get("result") or j.get("list") or [])
-            if not rows:
-                print(f"[KOFIA] {ep['url']} 응답 행 없음. 키={list(j)[:5]}")
-                continue
-
-            # 외국인 행 찾기
-            BUY = ("BUY_AMT", "BUYAMT", "BUY_TRDVAL", "FRGN_BUY")
-            SEL = ("SELL_AMT", "SELLAMT", "SELL_TRDVAL", "FRGN_SELL")
-            RPL = ("RPLM_AMT", "RPYMAMT", "RPLM_TRDVAL", "REPAY_AMT",
-                   "MTRT_AMT", "FRGN_REPAY")
-            NET = ("NET_AMT", "NETAMT", "NET_TRDVAL", "FRGN_NET")
-
-            total = 0.0
-            found = False
-            for row in rows:
-                name = (row.get("INVST_TP_NM") or row.get("INVST_NM") or
-                        row.get("INVSTTP_NM") or "").replace(" ", "")
-                if name and "외국인" not in name and "외국" not in name:
-                    continue
-                # 순유입 통합 필드 우선
-                net_val = next((float(str(row[k]).replace(",", ""))
-                                for k in NET if row.get(k) not in (None, "", "-")), None)
-                if net_val is not None:
-                    total += net_val
-                    found = True
-                    continue
-                # 매수 - 매도 - 상환원금
-                buy = next((float(str(row[k]).replace(",", ""))
-                            for k in BUY if row.get(k) not in (None, "", "-")), None)
-                sel = next((float(str(row[k]).replace(",", ""))
-                            for k in SEL if row.get(k) not in (None, "", "-")), None)
-                rpl = next((float(str(row[k]).replace(",", ""))
-                            for k in RPL if row.get(k) not in (None, "", "-")), 0.0)
-                if buy is not None and sel is not None:
-                    total += buy - sel - rpl
-                    found = True
-
-            if found:
-                print(f"[KOFIA] 채권 외국인 순유입: {total/10000:+.2f}조")
-                return total  # 억원
-            print(f"[KOFIA] 외국인 행/필드 미발견. 샘플={rows[:1]}")
-        except Exception as ex:
-            print(f"[KOFIA] {ep['url']} 예외: {ex}")
-
-    print("[KOFIA] 채권 데이터 수집 실패 → 주식만으로 합산")
-    return None
 
 
 def foreign_flows_2m():
     """어제 기준 직전 2개월 외인 순매수 누적 → 조원.
-    주식(코스피+코스닥): 네이버금융 일별 외국인 순매수 합산
-    채권: KOFIA 매수-매도-상환원금(계약시점)
+    주식(코스피+코스닥): KRX MDCSTAT02201 외국인 NETBID_TRDVAL
+    채권: KRX MDCSTAT11001 외국인 NETBID_TRDVAL (선택적)
     """
     today = dt.datetime.now(KST).date()
     end = today - dt.timedelta(days=1)
@@ -307,15 +246,12 @@ def foreign_flows_2m():
 
     total, got = 0.0, []
 
-    # 주식: 네이버금융 (억원 단위)
-    for label, sosok in [("코스피", 0), ("코스닥", 1)]:
-        v = _naver_stock_2m(label, sosok, start, end)
-        if v is not None:
-            total += v
-            got.append(label)
+    stock_v = _krx_stock_2m(start, end)
+    if stock_v is not None:
+        total += stock_v
+        got.append("주식(코스피+코스닥)")
 
-    # 채권: KOFIA (억원 단위)
-    bond_v = _kofia_bond_2m(start, end)
+    bond_v = _krx_bond_2m(start, end)
     if bond_v is not None:
         total += bond_v
         got.append("채권")
@@ -324,7 +260,7 @@ def foreign_flows_2m():
         print("[외인자금] 전부 실패 → 지표 N/A")
         return None
 
-    result_jo = round(total / 10000, 2)  # 억원 → 조원
+    result_jo = round(total / 1e12, 2)  # 원 → 조원
     print(f"[외인자금] 합산({'+'.join(got)}) 누적: {result_jo:+.2f}조")
     return result_jo
 
@@ -782,8 +718,8 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
       종합결과 — 2개 이상 지표가 1단계↑ 진입 시 위기 1단계, 2개 이상 2단계 진입 시 위기 2단계 ·
       기준 초과는 <span style="color:#c0392b">빨간색</span> 표시<br>
       ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 어제 기준 직전 2개월 누적
-      (주식: 네이버금융 일별 외국인 순매수 합산, 채권: KOFIA 매수-매도-상환원금 계약시점 기준) ·
-      출처: 금융감독원·네이버금융·금융투자협회. 정확성 보장하지 않음.
+      (주식: KRX 투자자별 거래실적 외국인 순매수 코스피+코스닥 합산, 채권: KRX 채권 외국인 순매수) ·
+      출처: 금융감독원·KRX(한국거래소). 정확성 보장하지 않음.
     </div>
   </div>
   {news_html}
