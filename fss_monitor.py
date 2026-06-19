@@ -132,30 +132,76 @@ KRX_BASE = "https://data.krx.co.kr"
 KRX_JSON = KRX_BASE + "/comm/bldAttendant/getJsonData.cmd"
 
 
-def _krx_session():
-    """KRX 세션 쿠키 획득. requests.Session 반환."""
+def _krx_session(menu_id):
+    """KRX 세션 쿠키 획득. requests.Session 반환.
+    menu_id 화면을 GET해 JSESSIONID 등 세션 쿠키를 받아온다.
+    """
     sess = requests.Session()
     sess.headers.update({
         "User-Agent": UA,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9",
-        "Origin": KRX_BASE,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
     })
-    # JS 쿠키 수동 설정
-    sess.cookies.set("mdc.client_session", "true", domain="data.krx.co.kr")
-    # 세션 워밍업 (JSESSIONID 획득)
+    # 1) 메인 진입으로 기본 세션 쿠키 확보
     try:
-        warmup_url = KRX_BASE + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020301"
-        sess.get(warmup_url, timeout=20)
+        sess.get(KRX_BASE + "/contents/MDC/MAIN/main/index.cmd", timeout=20)
     except Exception as ex:
-        print(f"[KRX] 세션 워밍업 실패(무시): {ex}")
+        print(f"[KRX] 메인 워밍업 실패(무시): {ex}")
+    # 2) 해당 통계 화면 진입 (Referer 일관성 + 세션 갱신)
+    try:
+        sess.get(KRX_BASE + f"/contents/MDC/MDI/mdiLoader/index.cmd?menuId={menu_id}",
+                 timeout=20)
+    except Exception as ex:
+        print(f"[KRX] 화면 워밍업 실패(무시): {ex}")
+    # 3) JS가 심는 쿠키 수동 보강
+    sess.cookies.set("mdc.client_session", "true", domain="data.krx.co.kr")
     return sess
+
+
+def _krx_fetch(label, menu_id, payload):
+    """KRX getJsonData 호출 → 외국인 NETBID_TRDVAL(원) 반환. 실패 시 None.
+    진단을 위해 비정상 응답 시 status/본문 일부를 출력한다.
+    """
+    sess = _krx_session(menu_id)
+    headers = {
+        "Referer": KRX_BASE + f"/contents/MDC/MDI/mdiLoader/index.cmd?menuId={menu_id}",
+        "Origin": KRX_BASE,
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }
+    try:
+        r = sess.post(KRX_JSON, data=payload, headers=headers, timeout=30)
+        if r.status_code != 200:
+            print(f"[KRX {label}] HTTP {r.status_code} · 본문[:300]={r.text[:300]!r}")
+            return None
+        try:
+            j = r.json()
+        except Exception:
+            print(f"[KRX {label}] JSON 파싱 실패 · 본문[:300]={r.text[:300]!r}")
+            return None
+        rows = j.get("output") or j.get("OutBlock_1") or j.get("block1") or []
+        if not rows:
+            print(f"[KRX {label}] 응답 행 없음 · 키={list(j)[:6]} · 본문[:300]={r.text[:300]!r}")
+            return None
+        for row in rows:
+            name = (row.get("INVST_TP_NM") or row.get("INVST_NM") or "").replace(" ", "")
+            if "외국인" in name:
+                raw = str(row.get("NETBID_TRDVAL", "")).replace(",", "")
+                val = float(raw)
+                print(f"[KRX {label}] 외국인 순매수: {val/1e12:+.2f}조")
+                return val  # 원 단위
+        print(f"[KRX {label}] 외국인 행 미발견. 행수={len(rows)}, 샘플={rows[:1]}")
+        return None
+    except Exception as ex:
+        print(f"[KRX {label}] 오류: {ex}")
+        return None
 
 
 def _krx_stock_2m(start, end):
     """KRX 주식(코스피+코스닥) 외국인 순매수 2개월 누적(원). 실패 시 None."""
-    sess = _krx_session()
-    payload = {
+    return _krx_fetch("주식", "MDC0201020301", {
         "bld": "dbms/MDC/STAT/standard/MDCSTAT02201",
         "locale": "ko_KR",
         "inqTpCd": "1",      # 기간별
@@ -164,37 +210,15 @@ def _krx_stock_2m(start, end):
         "mktId": "ALL",      # 코스피+코스닥
         "strtDd": start.strftime("%Y%m%d"),
         "endDd": end.strftime("%Y%m%d"),
-        "share": "2",
-        "money": "3",
+        "share": "1",
+        "money": "1",
         "csvxls_isNo": "false",
-    }
-    headers = {
-        "Referer": KRX_BASE + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020301",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    try:
-        r = sess.post(KRX_JSON, data=payload, headers=headers, timeout=30)
-        r.raise_for_status()
-        j = r.json()
-        rows = j.get("output") or []
-        for row in rows:
-            name = (row.get("INVST_TP_NM") or "").replace(" ", "")
-            if "외국인" in name:
-                raw = str(row.get("NETBID_TRDVAL", "")).replace(",", "")
-                val = float(raw)
-                print(f"[KRX 주식] 외국인 순매수 {start}~{end}: {val/1e12:+.2f}조")
-                return val  # 원 단위
-        print(f"[KRX 주식] 외국인 행 미발견. 행수={len(rows)}, 샘플={rows[:1]}")
-        return None
-    except Exception as ex:
-        print(f"[KRX 주식] 오류: {ex}")
-        return None
+    })
 
 
 def _krx_bond_2m(start, end):
     """KRX 채권 외국인 순매수(매수-매도) 2개월 누적(원). 실패 시 None."""
-    sess = _krx_session()
-    payload = {
+    return _krx_fetch("채권", "MDC0204010100", {
         "bld": "dbms/MDC/STAT/standard/MDCSTAT11001",
         "locale": "ko_KR",
         "inqTpCd": "1",
@@ -202,31 +226,10 @@ def _krx_bond_2m(start, end):
         "askBid": "3",
         "strtDd": start.strftime("%Y%m%d"),
         "endDd": end.strftime("%Y%m%d"),
-        "share": "2",
-        "money": "3",
+        "share": "1",
+        "money": "1",
         "csvxls_isNo": "false",
-    }
-    headers = {
-        "Referer": KRX_BASE + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0204010100",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    try:
-        r = sess.post(KRX_JSON, data=payload, headers=headers, timeout=30)
-        r.raise_for_status()
-        j = r.json()
-        rows = j.get("output") or []
-        for row in rows:
-            name = (row.get("INVST_TP_NM") or "").replace(" ", "")
-            if "외국인" in name:
-                raw = str(row.get("NETBID_TRDVAL", "")).replace(",", "")
-                val = float(raw)
-                print(f"[KRX 채권] 외국인 순매수 {start}~{end}: {val/1e12:+.2f}조")
-                return val  # 원 단위
-        print(f"[KRX 채권] 외국인 행 미발견. 행수={len(rows)}, 샘플={rows[:1]}")
-        return None
-    except Exception as ex:
-        print(f"[KRX 채권] 오류(비필수): {ex}")
-        return None
+    })
 
 
 def foreign_flows_2m():
