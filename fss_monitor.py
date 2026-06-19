@@ -43,7 +43,7 @@ FOREIGN_TRIGGER = (-5.0, -7.0)
 FOREIGN_HISTORY = (os.environ.get("FOREIGN_HISTORY")
                    or os.path.expanduser("~/.fss_monitor/foreign_history.csv"))
 # 파서 버전: 채권 행 조건 강화 후 올려 이력 자동 재백필 트리거.
-FOREIGN_PARSER_VER = 2
+FOREIGN_PARSER_VER = 3
 FOREIGN_VER_FILE   = FOREIGN_HISTORY.replace(".csv", ".ver")
 
 LOOKBACK = 7
@@ -157,6 +157,8 @@ def _daily_col(line):
     행 구조: 라벨 [년중·년중·전월중·당월중](조원·소수) [전일·당일·잔액](억원·정수) [비중].
     억원 컬럼은 콤마 정수(소수점 없음) → [전일, 당일, 잔액]. 당일 = 끝에서 두 번째.
     """
+    # pdfplumber가 천단위 숫자 '3,497,161'을 '3 ,497,161'처럼 쪼개는 경우 복구
+    line = re.sub(r"(\d)\s+,", r"\1,", line)
     ints = []
     for t in line.split():
         if "." in t or "(" in t or "%" in t:
