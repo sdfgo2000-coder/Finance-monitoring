@@ -12,7 +12,7 @@ FSS 일일 금융시장동향 → 통합 조기경보지표 일일 모니터링 
   외인자금(직전 2개월 누적 순매수) : 1단계 -5조, 2단계 -7조 (이하·순유출 위험)
 종합결과 : 6개 중 2개 이상이 1단계↑ → 위기 1단계 / 2개 이상이 2단계 → 위기 2단계
 """
-import os, re, ssl, sys, json, smtplib
+import os, re, ssl, sys, json, smtplib, calendar
 import html as html_lib
 import urllib.parse
 import datetime as dt
@@ -37,6 +37,11 @@ ABS_TRIGGER  = (100, 250)
 CRISIS_COUNT = 2
 
 FOREIGN_TRIGGER = (-5.0, -7.0)
+
+# 외인자금 일별 누적 이력: self-hosted 러너 홈에 영속 저장(체크아웃에 영향 없음).
+# 매 실행 PDF '일중(당일)' 순매수(억원)를 적립 → 직전 2개월(base-2개월~base) 합산.
+FOREIGN_HISTORY = (os.environ.get("FOREIGN_HISTORY")
+                   or os.path.expanduser("~/.fss_monitor/foreign_history.csv"))
 
 LOOKBACK = 7
 API = "https://www.fss.or.kr/fss/kr/openApi/api/fnncMrkt.jsp"
@@ -124,11 +129,114 @@ def extract(pdf_io):
     v["base_date"] = (f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m
                       else dt.datetime.now(KST).strftime("%Y-%m-%d"))
     v["spread"] = round((v["corp3"] - v["ktb3"]) * 100, 1)
-    v["foreign_2m"] = _pdf_foreign_2m(text)
+    v["foreign_2m"] = compute_foreign_2m(text, v["base_date"])
     return v
 
 
-# ── 2-B. 외인 투자자금: FSS PDF '외국인 유가증권 투자' 표에서 직접 파싱 ──────────
+# ── 2-B. 외인 투자자금: PDF '일중(당일)' 순매수를 매일 누적 → 직전 2개월 합산 ──────
+def _daily_col(line):
+    """표 한 행에서 '일중 당일' 순매수를 억원 단위로 반환. 실패 시 None.
+    행 구조: 라벨 [년중·년중·전월중·당월중](조원·소수) [전일·당일·잔액](억원·정수) [비중].
+    억원 컬럼은 콤마 정수(소수점 없음) → [전일, 당일, 잔액]. 당일 = 끝에서 두 번째.
+    """
+    ints = []
+    for t in line.split():
+        if "." in t or "(" in t or "%" in t:
+            continue
+        c = t.replace(",", "")
+        if re.fullmatch(r"[+-]?\d+", c):
+            ints.append(int(c))
+    if len(ints) >= 3:
+        return ints[-2]          # 당일(억원), ints[-1]=잔액
+    return None
+
+
+def _pdf_daily_today(text):
+    """PDF '외국인 유가증권 투자' 표 → (주식 합계 당일, 채권 순매수 당일) 억원. 실패 None."""
+    stock = bond = None
+    in_sec = False
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if "외국인" in s and "유가증권 투자" in s:
+            in_sec = True
+        if not in_sec:
+            continue
+        if s.startswith("합계"):
+            stock = _daily_col(s)
+        elif s.startswith("순매수"):
+            bond = _daily_col(s)
+    return stock, bond
+
+
+def _months_back(d, n):
+    """날짜 d에서 n개월 전 같은 날(말일 초과 시 해당 월 말일로 보정)."""
+    m = d.month - 1 - n
+    y = d.year + m // 12
+    m = m % 12 + 1
+    day = min(d.day, calendar.monthrange(y, m)[1])
+    return dt.date(y, m, day)
+
+
+def _load_history():
+    out = {}
+    try:
+        with open(FOREIGN_HISTORY, encoding="utf-8") as f:
+            for line in f:
+                p = line.strip().split(",")
+                if len(p) == 3:
+                    out[p[0]] = (float(p[1]), float(p[2]))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _save_history(hist):
+    os.makedirs(os.path.dirname(FOREIGN_HISTORY), exist_ok=True)
+    with open(FOREIGN_HISTORY, "w", encoding="utf-8") as f:
+        for d in sorted(hist):
+            s, b = hist[d]
+            f.write(f"{d},{s},{b}\n")
+
+
+def compute_foreign_2m(text, base_date_str):
+    """직전 2개월(base-2개월 ~ base) 외국인 순매수 누적(조원).
+      주력: PDF '일중(당일)' 순매수(억원)를 매일 이력에 적립 → 윈도우 합산(정확).
+      부트스트랩(이력이 윈도우 시작까지 닿지 않음): PDF '전월+당월 월중' 근사로 폴백.
+    """
+    try:
+        base = dt.date.fromisoformat(base_date_str)
+    except ValueError:
+        base = dt.datetime.now(KST).date()
+
+    stock_today, bond_today = _pdf_daily_today(text)
+    hist = _load_history()
+    if stock_today is not None and bond_today is not None:
+        hist[base_date_str] = (stock_today, bond_today)
+        _save_history(hist)
+        print(f"[외인자금] 당일({base_date_str}) 순매수 적립: "
+              f"주식 {stock_today:+,}억 · 채권 {bond_today:+,}억")
+    else:
+        print("[외인자금] PDF 일중(당일) 파싱 실패 → 당일 적립 생략")
+
+    cutoff = _months_back(base, 2)
+    dates = sorted(dt.date.fromisoformat(d) for d in hist)
+    window = [hist[d.isoformat()] for d in dates if cutoff <= d <= base]
+    earliest = dates[0] if dates else None
+    full = earliest is not None and earliest <= cutoff
+
+    if full and window:
+        eok = sum(s + b for s, b in window)
+        result = round(eok / 10000, 2)
+        print(f"[외인자금] 직전2개월({cutoff}~{base}) 일별누적 = {result:+.2f}조 "
+              f"(영업일 {len(window)}건)")
+        return result
+
+    print(f"[외인자금] 누적 이력 부족(보유 시작 {earliest}, 필요 {cutoff}) "
+          f"→ PDF 전월+당월 근사로 폴백")
+    return _pdf_foreign_2m(text)
+
+
+# ── 2-C. (폴백) 외인 투자자금: PDF '전월+당월 월중'에서 직접 파싱 ────────────────
 def _two_month_cols(line):
     """표 한 행에서 '월중' 두 컬럼(전월, 당월)을 (전월, 당월) 튜플로 반환(조원). 실패 시 None.
     행 구조: 라벨 [년중, 년중, 월중, 월중](조원·소수) [일중, 일중, 잔액](억원·정수) [비중].
@@ -631,8 +739,8 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
       금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp · 외인자금: 직전2개월누적 −5조/−7조<br>
       종합결과 — 2개 이상 지표가 1단계↑ 진입 시 위기 1단계, 2개 이상 2단계 진입 시 위기 2단계 ·
       기준 초과는 <span style="color:#c0392b">빨간색</span> 표시<br>
-      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 직전 2개월(전월+당월) 누적
-      (주식: 코스피+코스닥 합계, 채권: 순매수 / 출처 금융감독원 일일 금융시장 동향) ·
+      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 직전 2개월(당일~2개월전)
+      일별 순매수 누적(주식: 코스피+코스닥 합계, 채권: 순매수 / 매일 일중 순매수 적립, 이력 부족 시 전월+당월 근사) ·
       출처: 금융감독원 일일 금융시장 동향. 정확성 보장하지 않음.
     </div>
   </div>
