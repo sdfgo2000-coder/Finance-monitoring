@@ -8,16 +8,12 @@ on:
 
 jobs:
   monitor:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: ~/venv/bin/pip install -r requirements.txt
 
       - name: Run monitor & send email
         env:
@@ -37,4 +33,4 @@ jobs:
           ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
           # 요약 모델 — 비용 절감용 haiku(기본 opus). 바꾸려면 이 값만 수정
           NEWS_SUMMARY_MODEL:  claude-haiku-4-5
-        run: python fss_monitor.py
+        run: ~/venv/bin/python fss_monitor.py
