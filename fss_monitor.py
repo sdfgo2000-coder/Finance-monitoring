@@ -167,19 +167,23 @@ def _daily_col(line):
 
 
 def _pdf_daily_today(text):
-    """PDF '외국인 유가증권 투자' 표 → (주식 합계 당일, 채권 순매수 당일) 억원. 실패 None."""
+    """PDF '외국인 유가증권 투자' 표 → (주식 합계 당일, 채권 순매수 당일) 억원. 실패 None.
+    표 진입 후 '첫' 합계·순매수 행만 취하고 즉시 종료(이후 다른 표의 동명 행 오염 방지)."""
     stock = bond = None
     in_sec = False
     for ln in text.split("\n"):
         s = ln.strip()
         if "외국인" in s and "유가증권 투자" in s:
             in_sec = True
+            continue
         if not in_sec:
             continue
-        if s.startswith("합계"):
+        if stock is None and s.startswith("합계"):
             stock = _daily_col(s)
-        elif s.startswith("순매수"):
+        elif bond is None and s.startswith("순매수"):
             bond = _daily_col(s)
+        if stock is not None and bond is not None:
+            break
     return stock, bond
 
 
@@ -213,17 +217,32 @@ def _save_history(hist):
             f.write(f"{d},{s},{b}\n")
 
 
+def _date_chunks(start, end, days=28):
+    """[start, end]를 days 이하 길이의 부분구간으로 분할(FSS 개인키 조회한도 1개월 회피)."""
+    cur = start
+    while cur <= end:
+        nxt = min(cur + dt.timedelta(days=days), end)
+        yield cur, nxt
+        cur = nxt + dt.timedelta(days=1)
+
+
 def _backfill_history(auth_key, base, cutoff, hist):
-    """[cutoff, base] 구간 중 이력에 없는 영업일의 PDF를 받아 '당일' 순매수를 채움.
-    게시물 목록 API로 구간 전체를 한 번에 조회 → 부트스트랩 즉시 완성."""
+    """[cutoff, base] 구간 PDF를 받아 각 날짜의 '당일' 순매수를 이력에 채움.
+    FSS 개인 인증키는 1개월 조회한도가 있어 구간을 4주 단위로 쪼개 목록 조회.
+    파싱 성공 시 항상 덮어써 과거 오적립도 자가치유."""
     if not auth_key:
         print("[외인자금] FSS 인증키 없음 → 과거 PDF 백필 생략")
         return hist
-    try:
-        posts = list_daily_posts(auth_key, cutoff, base)
-    except Exception as ex:
-        print(f"[외인자금] 백필 목록조회 실패 → 폴백: {ex}")
-        return hist
+    posts, seen = [], set()
+    for cs, ce in _date_chunks(cutoff, base, 28):
+        try:
+            for p in list_daily_posts(auth_key, cs, ce):
+                u = p.get("atchfileUrl")
+                if u and u not in seen:
+                    seen.add(u)
+                    posts.append(p)
+        except Exception as ex:
+            print(f"[외인자금] 백필 목록조회 실패({cs}~{ce}): {ex}")
     added = 0
     for p in posts:
         url = p.get("atchfileUrl")
@@ -235,15 +254,16 @@ def _backfill_history(auth_key, base, cutoff, hist):
             print(f"[외인자금] 백필 PDF 실패({p.get('regDate')}): {ex}")
             continue
         d = _parse_base_date(text)
-        if d in hist or not (cutoff.isoformat() <= d <= base.isoformat()):
+        if not (cutoff.isoformat() <= d <= base.isoformat()):
             continue
         st, bo = _pdf_daily_today(text)
         if st is not None and bo is not None:
-            hist[d] = (st, bo)
-            added += 1
-    if added:
+            if d not in hist:
+                added += 1
+            hist[d] = (st, bo)          # 덮어쓰기(자가치유)
+    if posts:
         _save_history(hist)
-        print(f"[외인자금] 과거 PDF 백필 {added}건 추가 완료")
+        print(f"[외인자금] 과거 PDF 백필: 신규 {added}건 / 조회 {len(posts)}건")
     return hist
 
 
@@ -319,12 +339,15 @@ def _pdf_foreign_2m(text):
         s = ln.strip()
         if "외국인" in s and "유가증권 투자" in s:
             in_sec = True
+            continue
         if not in_sec:
             continue
-        if s.startswith("합계"):
+        if stock is None and s.startswith("합계"):
             stock = _two_month_cols(s)
-        elif s.startswith("순매수"):           # 채권 순매수(만기상환 등은 미감안)
+        elif bond is None and s.startswith("순매수"):   # 채권 순매수(만기상환 등은 미감안)
             bond = _two_month_cols(s)
+        if stock is not None and bond is not None:
+            break
 
     if stock is None and bond is None:
         print("[외인자금] PDF 표 파싱 실패 → 지표 N/A")
