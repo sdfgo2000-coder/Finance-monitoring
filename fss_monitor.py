@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 FSS 일일 금융시장동향 → 통합 조기경보지표 일일 모니터링 → 메일 발송
-  지표(6): 주가(KOSPI) / 환율(원·달러) / 금리(국고3년) / ROK CDS / 신용스프레드 / 외인자금(2개월 누적)
+  지표(6): 주가(KOSPI) / 환율(원·달러) / 금리(국고3년) / ROK CDS / 신용스프레드 / 외인자금(누적)
 
 트리거 기준
   주가  : 직전6개월 평균 대비  1단계 -10%,  2단계 -25%   (하락 위험)
   환율  : 직전6개월 평균 대비  1단계 +10%,  2단계 +25%   (상승 위험)
   금리  : 직전6개월 평균 대비  1단계 +60bp, 2단계 +120bp (상승 위험)
   ROK CDS / 신용스프레드 : 절대수준  1단계 100bp, 2단계 250bp
-  외인자금(2개월 누적 순매수) : 1단계 -5조, 2단계 -7조 (이하·순유출 위험)
+  외인자금(2026년 누적 순매수 YTD) : 1단계 -30조, 2단계 -50조 (이하·순유출 위험)
 종합결과 : 6개 중 2개 이상이 1단계↑ → 위기 1단계 / 2개 이상이 2단계 → 위기 2단계
 """
 import os, re, ssl, sys, json, smtplib
@@ -36,7 +36,7 @@ ECOS_SERIES = {
 ABS_TRIGGER  = (100, 250)
 CRISIS_COUNT = 2
 
-FOREIGN_TRIGGER = (-5.0, -7.0)
+FOREIGN_TRIGGER = (-30.0, -50.0)
 
 LOOKBACK = 7
 API = "https://www.fss.or.kr/fss/kr/openApi/api/fnncMrkt.jsp"
@@ -129,22 +129,22 @@ def extract(pdf_io):
 
 
 # ── 2-B. 외인 투자자금: FSS PDF '외국인 유가증권 투자' 표에서 직접 파싱 ──────────
-def _two_month_cols(line):
-    """표 한 행에서 '월중' 두 컬럼(전월, 당월)을 (전월, 당월) 튜플로 반환(조원). 실패 시 None.
-    행 구조: 라벨 [년중, 년중, 월중, 월중](조원·소수) [일중, 일중, 잔액](억원·정수) [비중].
-    조원 컬럼만 소수점을 가지므로(콤마 없는 소수) 그것만 모아 마지막 2개(=전월·당월 월중)를 취함.
+def _ytd_col(line):
+    """표 한 행에서 '26년중(YTD) 컬럼을 조원 단위로 반환. 실패 시 None.
+    행 구조: 라벨 ['25년중, '26년중, 전월중, 당월중](조원·소수) [전일,당일,잔액](억원·정수) [비중].
+    조원 컬럼만 콤마 없는 소수 → 두 번째 값(index 1)이 '26년중(YTD).
     """
     decimals = [float(t) for t in line.split() if re.fullmatch(r"[+-]?\d+\.\d+", t)]
     if len(decimals) >= 2:
-        return decimals[-2], decimals[-1]   # (전월 월중, 당월 월중)
+        return decimals[1]   # '26년중 YTD (index 0 = '25년중, index 1 = '26년중)
     return None
 
 
 def _pdf_foreign_2m(text):
-    """FSS PDF '외국인 유가증권 투자' 표 → 직전 2개월(전월+당월) 누적 순매수(조원).
-      주식: '합계' 행(코스피+코스닥) 월중 2개 합산
-      채권: '순매수' 행(만기상환 미감안) 월중 2개 합산
-    월중 컬럼 단위는 조원(표 머리글 명시). 실패 시 None.
+    """FSS PDF '외국인 유가증권 투자' 표 → 2026년 누적 순매수 YTD(조원).
+      주식: '합계' 행(코스피+코스닥) '26년중 컬럼
+      채권: '순매수' 행(만기상환 미감안) '26년중 컬럼
+    '26년중 컬럼 단위는 조원(표 머리글 명시). 실패 시 None.
     """
     stock = bond = None
     in_sec = False
@@ -155,9 +155,9 @@ def _pdf_foreign_2m(text):
         if not in_sec:
             continue
         if s.startswith("합계"):
-            stock = _two_month_cols(s)
+            stock = _ytd_col(s)
         elif s.startswith("순매수"):           # 채권 순매수(만기상환 등은 미감안)
-            bond = _two_month_cols(s)
+            bond = _ytd_col(s)
 
     if stock is None and bond is None:
         print("[외인자금] PDF 표 파싱 실패 → 지표 N/A")
@@ -165,17 +165,15 @@ def _pdf_foreign_2m(text):
 
     total, parts = 0.0, []
     if stock is not None:
-        ssum = round(stock[0] + stock[1], 2)
-        total += ssum
-        parts.append(f"주식(코스피+코스닥) 전월 {stock[0]:+.1f} + 당월 {stock[1]:+.1f} = {ssum:+.1f}")
+        total += stock
+        parts.append(f"주식(코스피+코스닥) '26년중 {stock:+.1f}조")
     if bond is not None:
-        bsum = round(bond[0] + bond[1], 2)
-        total += bsum
-        parts.append(f"채권 전월 {bond[0]:+.1f} + 당월 {bond[1]:+.1f} = {bsum:+.1f}")
+        total += bond
+        parts.append(f"채권 '26년중 {bond:+.1f}조")
     result = round(total, 2)
     for p in parts:
         print("[외인자금]   " + p)
-    print(f"[외인자금] 직전2개월 누적 합산 = {result:+.2f}조")
+    print(f"[외인자금] 2026년 누적 순매수(YTD) = {result:+.2f}조")
     return result
 
 
@@ -253,11 +251,11 @@ def analyze(d, avg=None, foreign_2m=None):
 
     f1, f2 = FOREIGN_TRIGGER
     if foreign_2m is None:
-        rows.append({"name": "외인 순매수 (2개월 누적·코스피·코스닥·채권)", "short": "외인자금",
+        rows.append({"name": "외인 순매수 (2026년 누적 YTD·코스피·코스닥·채권)", "short": "외인자금",
                      "unit": "조원", "t1": f"{f1:.0f}", "t2": f"{f2:.0f}",
                      "val": "N/A", "stage": 0, "sub": None})
     else:
-        rows.append({"name": "외인 순매수 (2개월 누적·코스피·코스닥·채권)", "short": "외인자금",
+        rows.append({"name": "외인 순매수 (2026년 누적 YTD·코스피·코스닥·채권)", "short": "외인자금",
                      "unit": "조원", "t1": f"{f1:.0f}", "t2": f"{f2:.0f}",
                      "val": f"{foreign_2m:+.2f}",
                      "stage": _stage_down(foreign_2m, f1, f2), "sub": None})
@@ -628,11 +626,11 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
     </table>
     <div style="margin:14px 0 4px;font-size:11px;color:#9aa;line-height:1.6">
       트리거 — 주가: 6개월평균 대비 1단계 −10%/2단계 −25% · 환율: +10%/+25% ·
-      금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp · 외인자금: 2개월누적 −5조/−7조<br>
+      금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp · 외인자금: 2026년 누적 YTD −30조/−50조<br>
       종합결과 — 2개 이상 지표가 1단계↑ 진입 시 위기 1단계, 2개 이상 2단계 진입 시 위기 2단계 ·
       기준 초과는 <span style="color:#c0392b">빨간색</span> 표시<br>
-      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 직전 2개월(전월+당월) 누적
-      (주식: 코스피+코스닥 합계, 채권: 순매수 / 출처 KOSCOM·KRX, 체결·결제 기준) ·
+      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 2026년 누적 순매수 YTD
+      (주식: 코스피+코스닥 합계 '26년중, 채권: 순매수 '26년중 / 출처 금융감독원 일일 금융시장 동향) ·
       출처: 금융감독원 일일 금융시장 동향. 정확성 보장하지 않음.
     </div>
   </div>
