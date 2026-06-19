@@ -129,17 +129,14 @@ def extract(pdf_io):
 
 
 # ── 2-B. 외인 투자자금: FSS PDF '외국인 유가증권 투자' 표에서 직접 파싱 ──────────
-def _two_month_jo(line):
-    """표 한 행에서 '월중'(전월+당월) 누적 합산(조원). 실패 시 None.
+def _two_month_cols(line):
+    """표 한 행에서 '월중' 두 컬럼(전월, 당월)을 (전월, 당월) 튜플로 반환(조원). 실패 시 None.
     행 구조: 라벨 [년중, 년중, 월중, 월중](조원·소수) [일중, 일중, 잔액](억원·정수) [비중].
-    조원 컬럼만 소수점을 가지므로(콤마 없는 소수) 그것만 모아 마지막 2개(=전월·당월 월중) 합산.
+    조원 컬럼만 소수점을 가지므로(콤마 없는 소수) 그것만 모아 마지막 2개(=전월·당월 월중)를 취함.
     """
-    decimals = []
-    for t in line.split():
-        if re.fullmatch(r"[+-]?\d+\.\d+", t):   # 콤마 없는 소수 = 조원(년중·월중) 컬럼
-            decimals.append(float(t))
+    decimals = [float(t) for t in line.split() if re.fullmatch(r"[+-]?\d+\.\d+", t)]
     if len(decimals) >= 2:
-        return round(decimals[-2] + decimals[-1], 2)
+        return decimals[-2], decimals[-1]   # (전월 월중, 당월 월중)
     return None
 
 
@@ -158,21 +155,27 @@ def _pdf_foreign_2m(text):
         if not in_sec:
             continue
         if s.startswith("합계"):
-            stock = _two_month_jo(s)
+            stock = _two_month_cols(s)
         elif s.startswith("순매수"):           # 채권 순매수(만기상환 등은 미감안)
-            bond = _two_month_jo(s)
+            bond = _two_month_cols(s)
 
     if stock is None and bond is None:
         print("[외인자금] PDF 표 파싱 실패 → 지표 N/A")
         return None
 
-    total, got = 0.0, []
+    total, parts = 0.0, []
     if stock is not None:
-        total += stock; got.append(f"주식(코스피+코스닥) {stock:+.1f}")
+        ssum = round(stock[0] + stock[1], 2)
+        total += ssum
+        parts.append(f"주식(코스피+코스닥) 전월 {stock[0]:+.1f} + 당월 {stock[1]:+.1f} = {ssum:+.1f}")
     if bond is not None:
-        total += bond; got.append(f"채권 {bond:+.1f}")
+        bsum = round(bond[0] + bond[1], 2)
+        total += bsum
+        parts.append(f"채권 전월 {bond[0]:+.1f} + 당월 {bond[1]:+.1f} = {bsum:+.1f}")
     result = round(total, 2)
-    print(f"[외인자금] 직전2개월 누적: {' / '.join(got)} → 합산 {result:+.2f}조")
+    for p in parts:
+        print("[외인자금]   " + p)
+    print(f"[외인자금] 직전2개월 누적 합산 = {result:+.2f}조")
     return result
 
 
