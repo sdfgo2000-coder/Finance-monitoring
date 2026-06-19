@@ -42,6 +42,9 @@ FOREIGN_TRIGGER = (-5.0, -7.0)
 # 매 실행 PDF '일중(당일)' 순매수(억원)를 적립 → 직전 2개월(base-2개월~base) 합산.
 FOREIGN_HISTORY = (os.environ.get("FOREIGN_HISTORY")
                    or os.path.expanduser("~/.fss_monitor/foreign_history.csv"))
+# 파서 버전: 채권 행 조건 강화 후 올려 이력 자동 재백필 트리거.
+FOREIGN_PARSER_VER = 2
+FOREIGN_VER_FILE   = FOREIGN_HISTORY.replace(".csv", ".ver")
 
 LOOKBACK = 7
 API = "https://www.fss.or.kr/fss/kr/openApi/api/fnncMrkt.jsp"
@@ -168,7 +171,7 @@ def _daily_col(line):
 
 def _pdf_daily_today(text):
     """PDF '외국인 유가증권 투자' 표 → (주식 합계 당일, 채권 순매수 당일) 억원. 실패 None.
-    표 진입 후 '첫' 합계·순매수 행만 취하고 즉시 종료(이후 다른 표의 동명 행 오염 방지)."""
+    채권 행은 '순매수(만기상환'으로 시작하는 고유 패턴으로 한정."""
     stock = bond = None
     in_sec = False
     for ln in text.split("\n"):
@@ -180,7 +183,7 @@ def _pdf_daily_today(text):
             continue
         if stock is None and s.startswith("합계"):
             stock = _daily_col(s)
-        elif bond is None and s.startswith("순매수"):
+        elif bond is None and "만기상환" in s and s.startswith("순매수"):
             bond = _daily_col(s)
         if stock is not None and bond is not None:
             break
@@ -289,6 +292,13 @@ def compute_foreign_2m(text, base_date_str, auth_key=None):
     else:
         print("[외인자금] PDF 일중(당일) 파싱 실패 → 당일 적립 생략")
 
+    # 파서 버전이 올라가면 이력을 전부 재백필하여 오적립 자가치유
+    try:
+        saved_ver = int(open(FOREIGN_VER_FILE).read().strip())
+    except Exception:
+        saved_ver = 0
+    force_backfill = saved_ver < FOREIGN_PARSER_VER
+
     # cutoff가 주말·공휴일이면 첫 영업일 게시물이 며칠 뒤일 수 있어 여유(5일) 허용
     cover_need = cutoff + dt.timedelta(days=5)
 
@@ -299,9 +309,17 @@ def compute_foreign_2m(text, base_date_str, auth_key=None):
         return win, earliest
 
     window, earliest = _window(hist)
-    if not (earliest is not None and earliest <= cover_need):
+    if force_backfill or not (earliest is not None and earliest <= cover_need):
+        if force_backfill:
+            print(f"[외인자금] 파서 버전 {saved_ver}→{FOREIGN_PARSER_VER} 업 → 전체 재백필")
         hist = _backfill_history(auth_key, base, cutoff, hist)
         window, earliest = _window(hist)
+        # 버전 파일 갱신
+        try:
+            os.makedirs(os.path.dirname(FOREIGN_VER_FILE), exist_ok=True)
+            open(FOREIGN_VER_FILE, "w").write(str(FOREIGN_PARSER_VER))
+        except Exception:
+            pass
 
     if earliest is not None and earliest <= cover_need and window:
         eok = sum(s + b for s, b in window)
@@ -344,7 +362,7 @@ def _pdf_foreign_2m(text):
             continue
         if stock is None and s.startswith("합계"):
             stock = _two_month_cols(s)
-        elif bond is None and s.startswith("순매수"):   # 채권 순매수(만기상환 등은 미감안)
+        elif bond is None and "만기상환" in s and s.startswith("순매수"):   # 채권 순매수(만기상환 등은 미감안)
             bond = _two_month_cols(s)
         if stock is not None and bond is not None:
             break
