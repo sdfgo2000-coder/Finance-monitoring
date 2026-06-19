@@ -12,7 +12,7 @@ FSS 일일 금융시장동향 → 통합 조기경보지표 일일 모니터링 
   외인자금(2개월 누적 순매수) : 1단계 -5조, 2단계 -7조 (이하·순유출 위험)
 종합결과 : 6개 중 2개 이상이 1단계↑ → 위기 1단계 / 2개 이상이 2단계 → 위기 2단계
 """
-import os, re, ssl, sys, json, smtplib, calendar, time
+import os, re, ssl, sys, json, smtplib
 import html as html_lib
 import urllib.parse
 import datetime as dt
@@ -124,148 +124,56 @@ def extract(pdf_io):
     v["base_date"] = (f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m
                       else dt.datetime.now(KST).strftime("%Y-%m-%d"))
     v["spread"] = round((v["corp3"] - v["ktb3"]) * 100, 1)
+    v["foreign_2m"] = _pdf_foreign_2m(text)
     return v
 
 
-# ── 2-B. 외인 투자자금: KRX HTTPS API ────────────────────────────────
-KRX_BASE = "https://data.krx.co.kr"
-KRX_JSON = KRX_BASE + "/comm/bldAttendant/getJsonData.cmd"
-
-
-def _krx_session(menu_id):
-    """KRX 세션 쿠키 획득. requests.Session 반환.
-    menu_id 화면을 GET해 JSESSIONID 등 세션 쿠키를 받아온다.
+# ── 2-B. 외인 투자자금: FSS PDF '외국인 유가증권 투자' 표에서 직접 파싱 ──────────
+def _two_month_jo(line):
+    """표 한 행에서 '월중'(전월+당월) 누적 합산(조원). 실패 시 None.
+    행 구조: 라벨 [년중, 년중, 월중, 월중](조원·소수) [일중, 일중, 잔액](억원·정수) [비중].
+    조원 컬럼만 소수점을 가지므로(콤마 없는 소수) 그것만 모아 마지막 2개(=전월·당월 월중) 합산.
     """
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-    })
-    # 1) 메인 진입으로 기본 세션 쿠키 확보
-    try:
-        sess.get(KRX_BASE + "/contents/MDC/MAIN/main/index.cmd", timeout=20)
-    except Exception as ex:
-        print(f"[KRX] 메인 워밍업 실패(무시): {ex}")
-    # 2) 해당 통계 화면 진입 (Referer 일관성 + 세션 갱신)
-    try:
-        sess.get(KRX_BASE + f"/contents/MDC/MDI/mdiLoader/index.cmd?menuId={menu_id}",
-                 timeout=20)
-    except Exception as ex:
-        print(f"[KRX] 화면 워밍업 실패(무시): {ex}")
-    # 3) JS가 심는 쿠키 수동 보강
-    sess.cookies.set("mdc.client_session", "true", domain="data.krx.co.kr")
-    return sess
+    decimals = []
+    for t in line.split():
+        if re.fullmatch(r"[+-]?\d+\.\d+", t):   # 콤마 없는 소수 = 조원(년중·월중) 컬럼
+            decimals.append(float(t))
+    if len(decimals) >= 2:
+        return round(decimals[-2] + decimals[-1], 2)
+    return None
 
 
-def _krx_fetch(label, menu_id, payload):
-    """KRX getJsonData 호출 → 외국인 NETBID_TRDVAL(원) 반환. 실패 시 None.
-    진단을 위해 비정상 응답 시 status/본문 일부를 출력한다.
+def _pdf_foreign_2m(text):
+    """FSS PDF '외국인 유가증권 투자' 표 → 직전 2개월(전월+당월) 누적 순매수(조원).
+      주식: '합계' 행(코스피+코스닥) 월중 2개 합산
+      채권: '순매수' 행(만기상환 미감안) 월중 2개 합산
+    월중 컬럼 단위는 조원(표 머리글 명시). 실패 시 None.
     """
-    sess = _krx_session(menu_id)
-    headers = {
-        "Referer": KRX_BASE + f"/contents/MDC/MDI/mdiLoader/index.cmd?menuId={menu_id}",
-        "Origin": KRX_BASE,
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    }
-    try:
-        r = sess.post(KRX_JSON, data=payload, headers=headers, timeout=30)
-        if r.status_code != 200:
-            print(f"[KRX {label}] HTTP {r.status_code} · 본문[:300]={r.text[:300]!r}")
-            return None
-        try:
-            j = r.json()
-        except Exception:
-            print(f"[KRX {label}] JSON 파싱 실패 · 본문[:300]={r.text[:300]!r}")
-            return None
-        rows = j.get("output") or j.get("OutBlock_1") or j.get("block1") or []
-        if not rows:
-            print(f"[KRX {label}] 응답 행 없음 · 키={list(j)[:6]} · 본문[:300]={r.text[:300]!r}")
-            return None
-        for row in rows:
-            name = (row.get("INVST_TP_NM") or row.get("INVST_NM") or "").replace(" ", "")
-            if "외국인" in name:
-                raw = str(row.get("NETBID_TRDVAL", "")).replace(",", "")
-                val = float(raw)
-                print(f"[KRX {label}] 외국인 순매수: {val/1e12:+.2f}조")
-                return val  # 원 단위
-        print(f"[KRX {label}] 외국인 행 미발견. 행수={len(rows)}, 샘플={rows[:1]}")
+    stock = bond = None
+    in_sec = False
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if "외국인" in s and "유가증권 투자" in s:
+            in_sec = True
+        if not in_sec:
+            continue
+        if s.startswith("합계"):
+            stock = _two_month_jo(s)
+        elif s.startswith("순매수"):           # 채권 순매수(만기상환 등은 미감안)
+            bond = _two_month_jo(s)
+
+    if stock is None and bond is None:
+        print("[외인자금] PDF 표 파싱 실패 → 지표 N/A")
         return None
-    except Exception as ex:
-        print(f"[KRX {label}] 오류: {ex}")
-        return None
-
-
-def _krx_stock_2m(start, end):
-    """KRX 주식(코스피+코스닥) 외국인 순매수 2개월 누적(원). 실패 시 None."""
-    return _krx_fetch("주식", "MDC0201020301", {
-        "bld": "dbms/MDC/STAT/standard/MDCSTAT02201",
-        "locale": "ko_KR",
-        "inqTpCd": "1",      # 기간별
-        "trdVolVal": "2",    # 거래대금
-        "askBid": "3",       # 순매수
-        "mktId": "ALL",      # 코스피+코스닥
-        "strtDd": start.strftime("%Y%m%d"),
-        "endDd": end.strftime("%Y%m%d"),
-        "share": "1",
-        "money": "1",
-        "csvxls_isNo": "false",
-    })
-
-
-def _krx_bond_2m(start, end):
-    """KRX 채권 외국인 순매수(매수-매도) 2개월 누적(원). 실패 시 None."""
-    return _krx_fetch("채권", "MDC0204010100", {
-        "bld": "dbms/MDC/STAT/standard/MDCSTAT11001",
-        "locale": "ko_KR",
-        "inqTpCd": "1",
-        "trdVolVal": "2",
-        "askBid": "3",
-        "strtDd": start.strftime("%Y%m%d"),
-        "endDd": end.strftime("%Y%m%d"),
-        "share": "1",
-        "money": "1",
-        "csvxls_isNo": "false",
-    })
-
-
-def foreign_flows_2m():
-    """어제 기준 직전 2개월 외인 순매수 누적 → 조원.
-    주식(코스피+코스닥): KRX MDCSTAT02201 외국인 NETBID_TRDVAL
-    채권: KRX MDCSTAT11001 외국인 NETBID_TRDVAL (선택적)
-    """
-    today = dt.datetime.now(KST).date()
-    end = today - dt.timedelta(days=1)
-    y, mo = end.year, end.month - 2
-    if mo <= 0:
-        mo += 12
-        y -= 1
-    day = min(end.day, calendar.monthrange(y, mo)[1])
-    start = dt.date(y, mo, day)
-    print(f"[외인자금] 2개월 구간: {start} ~ {end}")
 
     total, got = 0.0, []
-
-    stock_v = _krx_stock_2m(start, end)
-    if stock_v is not None:
-        total += stock_v
-        got.append("주식(코스피+코스닥)")
-
-    bond_v = _krx_bond_2m(start, end)
-    if bond_v is not None:
-        total += bond_v
-        got.append("채권")
-
-    if not got:
-        print("[외인자금] 전부 실패 → 지표 N/A")
-        return None
-
-    result_jo = round(total / 1e12, 2)  # 원 → 조원
-    print(f"[외인자금] 합산({'+'.join(got)}) 누적: {result_jo:+.2f}조")
-    return result_jo
+    if stock is not None:
+        total += stock; got.append(f"주식(코스피+코스닥) {stock:+.1f}")
+    if bond is not None:
+        total += bond; got.append(f"채권 {bond:+.1f}")
+    result = round(total, 2)
+    print(f"[외인자금] 직전2개월 누적: {' / '.join(got)} → 합산 {result:+.2f}조")
+    return result
 
 
 # ── 3. 분석 ──────────────────────────────────────────────────────────
@@ -720,9 +628,9 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
       금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp · 외인자금: 2개월누적 −5조/−7조<br>
       종합결과 — 2개 이상 지표가 1단계↑ 진입 시 위기 1단계, 2개 이상 2단계 진입 시 위기 2단계 ·
       기준 초과는 <span style="color:#c0392b">빨간색</span> 표시<br>
-      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 어제 기준 직전 2개월 누적
-      (주식: KRX 투자자별 거래실적 외국인 순매수 코스피+코스닥 합산, 채권: KRX 채권 외국인 순매수) ·
-      출처: 금융감독원·KRX(한국거래소). 정확성 보장하지 않음.
+      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 직전 2개월(전월+당월) 누적
+      (주식: 코스피+코스닥 합계, 채권: 순매수 / 출처 KOSCOM·KRX, 체결·결제 기준) ·
+      출처: 금융감독원 일일 금융시장 동향. 정확성 보장하지 않음.
     </div>
   </div>
   {news_html}
@@ -791,12 +699,8 @@ def main():
         url, reg = fetch_daily_pdf_url(os.environ["FSS_AUTH_KEY"])
         print("PDF:", url, "| 게시:", reg)
         avg = {**SIX_MONTH_AVG, **ecos_six_month_avg()}
-        ff = None
-        try:
-            ff = foreign_flows_2m()
-        except Exception as ex:
-            print("[외인자금] 수집 실패 → 지표 N/A:", ex)
-        an = analyze(extract(download_pdf(url)), avg, foreign_2m=ff)
+        d = extract(download_pdf(url))
+        an = analyze(d, avg, foreign_2m=d.get("foreign_2m"))
         print("결과:", an["result"], "|", an["summary"])
         news_html, news_images = "", []
         try:
