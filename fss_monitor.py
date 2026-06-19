@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 FSS 일일 금융시장동향 → 통합 조기경보지표 일일 모니터링 → 메일 발송
-  지표(6): 주가(KOSPI) / 환율(원·달러) / 금리(국고3년) / ROK CDS / 신용스프레드 / 외인자금(누적)
+  지표(6): 주가(KOSPI) / 환율(원·달러) / 금리(국고3년) / ROK CDS / 신용스프레드 / 외인자금(2개월 누적)
 
 트리거 기준
   주가  : 직전6개월 평균 대비  1단계 -10%,  2단계 -25%   (하락 위험)
   환율  : 직전6개월 평균 대비  1단계 +10%,  2단계 +25%   (상승 위험)
   금리  : 직전6개월 평균 대비  1단계 +60bp, 2단계 +120bp (상승 위험)
   ROK CDS / 신용스프레드 : 절대수준  1단계 100bp, 2단계 250bp
-  외인자금(2026년 누적 순매수 YTD) : 1단계 -30조, 2단계 -50조 (이하·순유출 위험)
+  외인자금(직전 2개월 누적 순매수) : 1단계 -5조, 2단계 -7조 (이하·순유출 위험)
 종합결과 : 6개 중 2개 이상이 1단계↑ → 위기 1단계 / 2개 이상이 2단계 → 위기 2단계
 """
-import os, re, ssl, sys, json, smtplib
+import os, re, ssl, sys, json, smtplib, calendar
 import html as html_lib
 import urllib.parse
 import datetime as dt
@@ -36,7 +36,12 @@ ECOS_SERIES = {
 ABS_TRIGGER  = (100, 250)
 CRISIS_COUNT = 2
 
-FOREIGN_TRIGGER = (-30.0, -50.0)
+FOREIGN_TRIGGER = (-5.0, -7.0)
+
+# 외인자금 일별 누적 이력: self-hosted 러너 홈에 영속 저장(체크아웃에 영향 없음).
+# 매 실행 PDF '일중(당일)' 순매수(억원)를 적립 → 직전 2개월(base-2개월~base) 합산.
+FOREIGN_HISTORY = (os.environ.get("FOREIGN_HISTORY")
+                   or os.path.expanduser("~/.fss_monitor/foreign_history.csv"))
 
 LOOKBACK = 7
 API = "https://www.fss.or.kr/fss/kr/openApi/api/fnncMrkt.jsp"
@@ -61,25 +66,32 @@ NEWS_SUMMARY_MODEL = os.environ.get("NEWS_SUMMARY_MODEL", "claude-opus-4-8")
 
 
 # ── 1. 금감원 API ────────────────────────────────────────────────────
-def fetch_daily_pdf_url(auth_key):
-    today = dt.datetime.now(KST).date()
+def list_daily_posts(auth_key, start, end):
+    """[start, end] 구간의 '일일 금융시장 동향' 게시물을 regDate 내림차순으로 반환.
+    각 원소: {"atchfileUrl", "regDate"}. (start, end: date)"""
     params = {"apiType": "json",
-              "startDate": (today - dt.timedelta(days=LOOKBACK)).strftime("%Y%m%d"),
-              "endDate": today.strftime("%Y%m%d"),
+              "startDate": start.strftime("%Y%m%d"),
+              "endDate": end.strftime("%Y%m%d"),
               "authKey": (auth_key or "").strip()}
-    headers = {"User-Agent": UA}
-    r = requests.get(API, params=params, headers=headers, timeout=30)
+    r = requests.get(API, params=params, headers={"User-Agent": UA}, timeout=30)
     r.raise_for_status()
     data = r.json()
     root = data.get("reponse") or data.get("response") or data
     rows = root.get("result") or []
     daily = [x for x in rows if "일일 금융시장 동향" in (x.get("subject") or "")]
+    daily.sort(key=lambda x: x.get("regDate", ""), reverse=True)
     if not daily:
         print(f"[진단] resultCode={root.get('resultCode')} resultMsg={root.get('resultMsg')} "
               f"resultCnt={root.get('resultCnt')}")
         print(f"[진단] 받은 제목들: {[x.get('subject') for x in rows]}")
+    return daily
+
+
+def fetch_daily_pdf_url(auth_key):
+    today = dt.datetime.now(KST).date()
+    daily = list_daily_posts(auth_key, today - dt.timedelta(days=LOOKBACK), today)
+    if not daily:
         raise RuntimeError("일일 금융시장 동향 게시물을 찾지 못했습니다.")
-    daily.sort(key=lambda x: x.get("regDate", ""), reverse=True)
     return daily[0]["atchfileUrl"], daily[0].get("regDate", "")
 
 
@@ -100,9 +112,19 @@ def _today_value(line):
     return nums[-1] if nums else None
 
 
-def extract(pdf_io):
+def pdf_text(pdf_io):
     with pdfplumber.open(pdf_io) as pdf:
-        text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        return "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+
+def _parse_base_date(text):
+    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\([월화수목금토일]\)\s*기준", text)
+    return (f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m
+            else dt.datetime.now(KST).strftime("%Y-%m-%d"))
+
+
+def extract(pdf_io, auth_key=None):
+    text = pdf_text(pdf_io)
     v, in_cds = {}, False
     for ln in text.split("\n"):
         s = ln.strip()
@@ -120,31 +142,176 @@ def extract(pdf_io):
     assert 1000 < v["kospi"] < 20000 and 800 < v["fx"] < 2500
     assert 0 < v["ktb3"] < 15 and 0 < v["corp3"] < 20 and 0 < v["cds"] < 500
 
-    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\([월화수목금토일]\)\s*기준", text)
-    v["base_date"] = (f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m
-                      else dt.datetime.now(KST).strftime("%Y-%m-%d"))
+    v["base_date"] = _parse_base_date(text)
     v["spread"] = round((v["corp3"] - v["ktb3"]) * 100, 1)
-    v["foreign_2m"] = _pdf_foreign_2m(text)
+    v["foreign_2m"] = compute_foreign_2m(text, v["base_date"], auth_key)
     return v
 
 
-# ── 2-B. 외인 투자자금: FSS PDF '외국인 유가증권 투자' 표에서 직접 파싱 ──────────
-def _ytd_col(line):
-    """표 한 행에서 '26년중(YTD) 컬럼을 조원 단위로 반환. 실패 시 None.
-    행 구조: 라벨 ['25년중, '26년중, 전월중, 당월중](조원·소수) [전일,당일,잔액](억원·정수) [비중].
-    조원 컬럼만 콤마 없는 소수 → 두 번째 값(index 1)이 '26년중(YTD).
+# ── 2-B. 외인 투자자금: PDF '일중(당일)' 순매수를 매일 누적 → 직전 2개월 합산 ──────
+def _daily_col(line):
+    """표 한 행에서 '일중 당일' 순매수를 억원 단위로 반환. 실패 시 None.
+    행 구조: 라벨 [년중·년중·전월중·당월중](조원·소수) [전일·당일·잔액](억원·정수) [비중].
+    억원 컬럼은 콤마 정수(소수점 없음) → [전일, 당일, 잔액]. 당일 = 끝에서 두 번째.
+    """
+    ints = []
+    for t in line.split():
+        if "." in t or "(" in t or "%" in t:
+            continue
+        c = t.replace(",", "")
+        if re.fullmatch(r"[+-]?\d+", c):
+            ints.append(int(c))
+    if len(ints) >= 3:
+        return ints[-2]          # 당일(억원), ints[-1]=잔액
+    return None
+
+
+def _pdf_daily_today(text):
+    """PDF '외국인 유가증권 투자' 표 → (주식 합계 당일, 채권 순매수 당일) 억원. 실패 None."""
+    stock = bond = None
+    in_sec = False
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if "외국인" in s and "유가증권 투자" in s:
+            in_sec = True
+        if not in_sec:
+            continue
+        if s.startswith("합계"):
+            stock = _daily_col(s)
+        elif s.startswith("순매수"):
+            bond = _daily_col(s)
+    return stock, bond
+
+
+def _months_back(d, n):
+    """날짜 d에서 n개월 전 같은 날(말일 초과 시 해당 월 말일로 보정)."""
+    m = d.month - 1 - n
+    y = d.year + m // 12
+    m = m % 12 + 1
+    day = min(d.day, calendar.monthrange(y, m)[1])
+    return dt.date(y, m, day)
+
+
+def _load_history():
+    out = {}
+    try:
+        with open(FOREIGN_HISTORY, encoding="utf-8") as f:
+            for line in f:
+                p = line.strip().split(",")
+                if len(p) == 3:
+                    out[p[0]] = (float(p[1]), float(p[2]))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _save_history(hist):
+    os.makedirs(os.path.dirname(FOREIGN_HISTORY), exist_ok=True)
+    with open(FOREIGN_HISTORY, "w", encoding="utf-8") as f:
+        for d in sorted(hist):
+            s, b = hist[d]
+            f.write(f"{d},{s},{b}\n")
+
+
+def _backfill_history(auth_key, base, cutoff, hist):
+    """[cutoff, base] 구간 중 이력에 없는 영업일의 PDF를 받아 '당일' 순매수를 채움.
+    게시물 목록 API로 구간 전체를 한 번에 조회 → 부트스트랩 즉시 완성."""
+    if not auth_key:
+        print("[외인자금] FSS 인증키 없음 → 과거 PDF 백필 생략")
+        return hist
+    try:
+        posts = list_daily_posts(auth_key, cutoff, base)
+    except Exception as ex:
+        print(f"[외인자금] 백필 목록조회 실패 → 폴백: {ex}")
+        return hist
+    added = 0
+    for p in posts:
+        url = p.get("atchfileUrl")
+        if not url:
+            continue
+        try:
+            text = pdf_text(download_pdf(url))
+        except Exception as ex:
+            print(f"[외인자금] 백필 PDF 실패({p.get('regDate')}): {ex}")
+            continue
+        d = _parse_base_date(text)
+        if d in hist or not (cutoff.isoformat() <= d <= base.isoformat()):
+            continue
+        st, bo = _pdf_daily_today(text)
+        if st is not None and bo is not None:
+            hist[d] = (st, bo)
+            added += 1
+    if added:
+        _save_history(hist)
+        print(f"[외인자금] 과거 PDF 백필 {added}건 추가 완료")
+    return hist
+
+
+def compute_foreign_2m(text, base_date_str, auth_key=None):
+    """직전 2개월(base-2개월 ~ base) 외국인 순매수 누적(조원).
+      주력: PDF '일중(당일)' 순매수(억원)를 이력에 적립 → 윈도우 합산(정확).
+      이력이 윈도우를 못 덮으면 과거 PDF를 일괄 백필하여 즉시 완성.
+      그래도 부족하면 PDF '전월+당월 월중' 근사로 폴백.
+    """
+    try:
+        base = dt.date.fromisoformat(base_date_str)
+    except ValueError:
+        base = dt.datetime.now(KST).date()
+    cutoff = _months_back(base, 2)
+
+    stock_today, bond_today = _pdf_daily_today(text)
+    hist = _load_history()
+    if stock_today is not None and bond_today is not None:
+        hist[base_date_str] = (stock_today, bond_today)
+        _save_history(hist)
+        print(f"[외인자금] 당일({base_date_str}) 순매수 적립: "
+              f"주식 {stock_today:+,}억 · 채권 {bond_today:+,}억")
+    else:
+        print("[외인자금] PDF 일중(당일) 파싱 실패 → 당일 적립 생략")
+
+    # cutoff가 주말·공휴일이면 첫 영업일 게시물이 며칠 뒤일 수 있어 여유(5일) 허용
+    cover_need = cutoff + dt.timedelta(days=5)
+
+    def _window(h):
+        ds = sorted(dt.date.fromisoformat(d) for d in h)
+        win = [h[d.isoformat()] for d in ds if cutoff <= d <= base]
+        earliest = next((d for d in ds if cutoff <= d <= base), None)
+        return win, earliest
+
+    window, earliest = _window(hist)
+    if not (earliest is not None and earliest <= cover_need):
+        hist = _backfill_history(auth_key, base, cutoff, hist)
+        window, earliest = _window(hist)
+
+    if earliest is not None and earliest <= cover_need and window:
+        eok = sum(s + b for s, b in window)
+        result = round(eok / 10000, 2)
+        print(f"[외인자금] 직전2개월({cutoff}~{base}) 일별누적 = {result:+.2f}조 "
+              f"(영업일 {len(window)}건)")
+        return result
+
+    print(f"[외인자금] 누적 이력 부족(보유 시작 {earliest}, 필요 {cutoff}) "
+          f"→ PDF 전월+당월 근사로 폴백")
+    return _pdf_foreign_2m(text)
+
+
+# ── 2-C. (폴백) 외인 투자자금: PDF '전월+당월 월중'에서 직접 파싱 ────────────────
+def _two_month_cols(line):
+    """표 한 행에서 '월중' 두 컬럼(전월, 당월)을 (전월, 당월) 튜플로 반환(조원). 실패 시 None.
+    행 구조: 라벨 [년중, 년중, 월중, 월중](조원·소수) [일중, 일중, 잔액](억원·정수) [비중].
+    조원 컬럼만 소수점을 가지므로(콤마 없는 소수) 그것만 모아 마지막 2개(=전월·당월 월중)를 취함.
     """
     decimals = [float(t) for t in line.split() if re.fullmatch(r"[+-]?\d+\.\d+", t)]
     if len(decimals) >= 2:
-        return decimals[1]   # '26년중 YTD (index 0 = '25년중, index 1 = '26년중)
+        return decimals[-2], decimals[-1]   # (전월 월중, 당월 월중)
     return None
 
 
 def _pdf_foreign_2m(text):
-    """FSS PDF '외국인 유가증권 투자' 표 → 2026년 누적 순매수 YTD(조원).
-      주식: '합계' 행(코스피+코스닥) '26년중 컬럼
-      채권: '순매수' 행(만기상환 미감안) '26년중 컬럼
-    '26년중 컬럼 단위는 조원(표 머리글 명시). 실패 시 None.
+    """FSS PDF '외국인 유가증권 투자' 표 → 직전 2개월(전월+당월) 누적 순매수(조원).
+      주식: '합계' 행(코스피+코스닥) 월중 2개 합산
+      채권: '순매수' 행(만기상환 미감안) 월중 2개 합산
+    월중 컬럼 단위는 조원(표 머리글 명시). 실패 시 None.
     """
     stock = bond = None
     in_sec = False
@@ -155,9 +322,9 @@ def _pdf_foreign_2m(text):
         if not in_sec:
             continue
         if s.startswith("합계"):
-            stock = _ytd_col(s)
+            stock = _two_month_cols(s)
         elif s.startswith("순매수"):           # 채권 순매수(만기상환 등은 미감안)
-            bond = _ytd_col(s)
+            bond = _two_month_cols(s)
 
     if stock is None and bond is None:
         print("[외인자금] PDF 표 파싱 실패 → 지표 N/A")
@@ -165,15 +332,17 @@ def _pdf_foreign_2m(text):
 
     total, parts = 0.0, []
     if stock is not None:
-        total += stock
-        parts.append(f"주식(코스피+코스닥) '26년중 {stock:+.1f}조")
+        ssum = round(stock[0] + stock[1], 2)
+        total += ssum
+        parts.append(f"주식(코스피+코스닥) 전월 {stock[0]:+.1f} + 당월 {stock[1]:+.1f} = {ssum:+.1f}")
     if bond is not None:
-        total += bond
-        parts.append(f"채권 '26년중 {bond:+.1f}조")
+        bsum = round(bond[0] + bond[1], 2)
+        total += bsum
+        parts.append(f"채권 전월 {bond[0]:+.1f} + 당월 {bond[1]:+.1f} = {bsum:+.1f}")
     result = round(total, 2)
     for p in parts:
         print("[외인자금]   " + p)
-    print(f"[외인자금] 2026년 누적 순매수(YTD) = {result:+.2f}조")
+    print(f"[외인자금] 직전2개월 누적 합산 = {result:+.2f}조")
     return result
 
 
@@ -251,11 +420,11 @@ def analyze(d, avg=None, foreign_2m=None):
 
     f1, f2 = FOREIGN_TRIGGER
     if foreign_2m is None:
-        rows.append({"name": "외인 순매수 (2026년 누적 YTD·코스피·코스닥·채권)", "short": "외인자금",
+        rows.append({"name": "외인 순매수 (직전 2개월 누적·코스피·코스닥·채권)", "short": "외인자금",
                      "unit": "조원", "t1": f"{f1:.0f}", "t2": f"{f2:.0f}",
                      "val": "N/A", "stage": 0, "sub": None})
     else:
-        rows.append({"name": "외인 순매수 (2026년 누적 YTD·코스피·코스닥·채권)", "short": "외인자금",
+        rows.append({"name": "외인 순매수 (직전 2개월 누적·코스피·코스닥·채권)", "short": "외인자금",
                      "unit": "조원", "t1": f"{f1:.0f}", "t2": f"{f2:.0f}",
                      "val": f"{foreign_2m:+.2f}",
                      "stage": _stage_down(foreign_2m, f1, f2), "sub": None})
@@ -626,11 +795,11 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
     </table>
     <div style="margin:14px 0 4px;font-size:11px;color:#9aa;line-height:1.6">
       트리거 — 주가: 6개월평균 대비 1단계 −10%/2단계 −25% · 환율: +10%/+25% ·
-      금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp · 외인자금: 2026년 누적 YTD −30조/−50조<br>
+      금리: +60bp/+120bp · CDS·스프레드: 절대 100bp/250bp · 외인자금: 직전2개월누적 −5조/−7조<br>
       종합결과 — 2개 이상 지표가 1단계↑ 진입 시 위기 1단계, 2개 이상 2단계 진입 시 위기 2단계 ·
       기준 초과는 <span style="color:#c0392b">빨간색</span> 표시<br>
-      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 2026년 누적 순매수 YTD
-      (주식: 코스피+코스닥 합계 '26년중, 채권: 순매수 '26년중 / 출처 금융감독원 일일 금융시장 동향) ·
+      ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 직전 2개월(당일~2개월전)
+      일별 순매수 누적(주식: 코스피+코스닥 합계, 채권: 순매수 / 구간 PDF 일중 순매수 합산, 누락 시 전월+당월 근사) ·
       출처: 금융감독원 일일 금융시장 동향. 정확성 보장하지 않음.
     </div>
   </div>
@@ -697,10 +866,11 @@ def send_email(subject, html, images=None):
 
 def main():
     try:
-        url, reg = fetch_daily_pdf_url(os.environ["FSS_AUTH_KEY"])
+        auth_key = os.environ["FSS_AUTH_KEY"]
+        url, reg = fetch_daily_pdf_url(auth_key)
         print("PDF:", url, "| 게시:", reg)
         avg = {**SIX_MONTH_AVG, **ecos_six_month_avg()}
-        d = extract(download_pdf(url))
+        d = extract(download_pdf(url), auth_key)
         an = analyze(d, avg, foreign_2m=d.get("foreign_2m"))
         print("결과:", an["result"], "|", an["summary"])
         news_html, news_images = "", []
