@@ -66,25 +66,32 @@ NEWS_SUMMARY_MODEL = os.environ.get("NEWS_SUMMARY_MODEL", "claude-opus-4-8")
 
 
 # ── 1. 금감원 API ────────────────────────────────────────────────────
-def fetch_daily_pdf_url(auth_key):
-    today = dt.datetime.now(KST).date()
+def list_daily_posts(auth_key, start, end):
+    """[start, end] 구간의 '일일 금융시장 동향' 게시물을 regDate 내림차순으로 반환.
+    각 원소: {"atchfileUrl", "regDate"}. (start, end: date)"""
     params = {"apiType": "json",
-              "startDate": (today - dt.timedelta(days=LOOKBACK)).strftime("%Y%m%d"),
-              "endDate": today.strftime("%Y%m%d"),
+              "startDate": start.strftime("%Y%m%d"),
+              "endDate": end.strftime("%Y%m%d"),
               "authKey": (auth_key or "").strip()}
-    headers = {"User-Agent": UA}
-    r = requests.get(API, params=params, headers=headers, timeout=30)
+    r = requests.get(API, params=params, headers={"User-Agent": UA}, timeout=30)
     r.raise_for_status()
     data = r.json()
     root = data.get("reponse") or data.get("response") or data
     rows = root.get("result") or []
     daily = [x for x in rows if "일일 금융시장 동향" in (x.get("subject") or "")]
+    daily.sort(key=lambda x: x.get("regDate", ""), reverse=True)
     if not daily:
         print(f"[진단] resultCode={root.get('resultCode')} resultMsg={root.get('resultMsg')} "
               f"resultCnt={root.get('resultCnt')}")
         print(f"[진단] 받은 제목들: {[x.get('subject') for x in rows]}")
+    return daily
+
+
+def fetch_daily_pdf_url(auth_key):
+    today = dt.datetime.now(KST).date()
+    daily = list_daily_posts(auth_key, today - dt.timedelta(days=LOOKBACK), today)
+    if not daily:
         raise RuntimeError("일일 금융시장 동향 게시물을 찾지 못했습니다.")
-    daily.sort(key=lambda x: x.get("regDate", ""), reverse=True)
     return daily[0]["atchfileUrl"], daily[0].get("regDate", "")
 
 
@@ -105,9 +112,19 @@ def _today_value(line):
     return nums[-1] if nums else None
 
 
-def extract(pdf_io):
+def pdf_text(pdf_io):
     with pdfplumber.open(pdf_io) as pdf:
-        text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        return "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+
+def _parse_base_date(text):
+    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\([월화수목금토일]\)\s*기준", text)
+    return (f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m
+            else dt.datetime.now(KST).strftime("%Y-%m-%d"))
+
+
+def extract(pdf_io, auth_key=None):
+    text = pdf_text(pdf_io)
     v, in_cds = {}, False
     for ln in text.split("\n"):
         s = ln.strip()
@@ -125,11 +142,9 @@ def extract(pdf_io):
     assert 1000 < v["kospi"] < 20000 and 800 < v["fx"] < 2500
     assert 0 < v["ktb3"] < 15 and 0 < v["corp3"] < 20 and 0 < v["cds"] < 500
 
-    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\([월화수목금토일]\)\s*기준", text)
-    v["base_date"] = (f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m
-                      else dt.datetime.now(KST).strftime("%Y-%m-%d"))
+    v["base_date"] = _parse_base_date(text)
     v["spread"] = round((v["corp3"] - v["ktb3"]) * 100, 1)
-    v["foreign_2m"] = compute_foreign_2m(text, v["base_date"])
+    v["foreign_2m"] = compute_foreign_2m(text, v["base_date"], auth_key)
     return v
 
 
@@ -198,15 +213,51 @@ def _save_history(hist):
             f.write(f"{d},{s},{b}\n")
 
 
-def compute_foreign_2m(text, base_date_str):
+def _backfill_history(auth_key, base, cutoff, hist):
+    """[cutoff, base] 구간 중 이력에 없는 영업일의 PDF를 받아 '당일' 순매수를 채움.
+    게시물 목록 API로 구간 전체를 한 번에 조회 → 부트스트랩 즉시 완성."""
+    if not auth_key:
+        print("[외인자금] FSS 인증키 없음 → 과거 PDF 백필 생략")
+        return hist
+    try:
+        posts = list_daily_posts(auth_key, cutoff, base)
+    except Exception as ex:
+        print(f"[외인자금] 백필 목록조회 실패 → 폴백: {ex}")
+        return hist
+    added = 0
+    for p in posts:
+        url = p.get("atchfileUrl")
+        if not url:
+            continue
+        try:
+            text = pdf_text(download_pdf(url))
+        except Exception as ex:
+            print(f"[외인자금] 백필 PDF 실패({p.get('regDate')}): {ex}")
+            continue
+        d = _parse_base_date(text)
+        if d in hist or not (cutoff.isoformat() <= d <= base.isoformat()):
+            continue
+        st, bo = _pdf_daily_today(text)
+        if st is not None and bo is not None:
+            hist[d] = (st, bo)
+            added += 1
+    if added:
+        _save_history(hist)
+        print(f"[외인자금] 과거 PDF 백필 {added}건 추가 완료")
+    return hist
+
+
+def compute_foreign_2m(text, base_date_str, auth_key=None):
     """직전 2개월(base-2개월 ~ base) 외국인 순매수 누적(조원).
-      주력: PDF '일중(당일)' 순매수(억원)를 매일 이력에 적립 → 윈도우 합산(정확).
-      부트스트랩(이력이 윈도우 시작까지 닿지 않음): PDF '전월+당월 월중' 근사로 폴백.
+      주력: PDF '일중(당일)' 순매수(억원)를 이력에 적립 → 윈도우 합산(정확).
+      이력이 윈도우를 못 덮으면 과거 PDF를 일괄 백필하여 즉시 완성.
+      그래도 부족하면 PDF '전월+당월 월중' 근사로 폴백.
     """
     try:
         base = dt.date.fromisoformat(base_date_str)
     except ValueError:
         base = dt.datetime.now(KST).date()
+    cutoff = _months_back(base, 2)
 
     stock_today, bond_today = _pdf_daily_today(text)
     hist = _load_history()
@@ -218,13 +269,21 @@ def compute_foreign_2m(text, base_date_str):
     else:
         print("[외인자금] PDF 일중(당일) 파싱 실패 → 당일 적립 생략")
 
-    cutoff = _months_back(base, 2)
-    dates = sorted(dt.date.fromisoformat(d) for d in hist)
-    window = [hist[d.isoformat()] for d in dates if cutoff <= d <= base]
-    earliest = dates[0] if dates else None
-    full = earliest is not None and earliest <= cutoff
+    # cutoff가 주말·공휴일이면 첫 영업일 게시물이 며칠 뒤일 수 있어 여유(5일) 허용
+    cover_need = cutoff + dt.timedelta(days=5)
 
-    if full and window:
+    def _window(h):
+        ds = sorted(dt.date.fromisoformat(d) for d in h)
+        win = [h[d.isoformat()] for d in ds if cutoff <= d <= base]
+        earliest = next((d for d in ds if cutoff <= d <= base), None)
+        return win, earliest
+
+    window, earliest = _window(hist)
+    if not (earliest is not None and earliest <= cover_need):
+        hist = _backfill_history(auth_key, base, cutoff, hist)
+        window, earliest = _window(hist)
+
+    if earliest is not None and earliest <= cover_need and window:
         eok = sum(s + b for s, b in window)
         result = round(eok / 10000, 2)
         print(f"[외인자금] 직전2개월({cutoff}~{base}) 일별누적 = {result:+.2f}조 "
@@ -740,7 +799,7 @@ box-shadow:0 1px 5px rgba(0,0,0,.08)">
       종합결과 — 2개 이상 지표가 1단계↑ 진입 시 위기 1단계, 2개 이상 2단계 진입 시 위기 2단계 ·
       기준 초과는 <span style="color:#c0392b">빨간색</span> 표시<br>
       ※ 직전6개월 평균은 ECOS 자동계산(미연동 지표는 설정값) · 외인자금은 직전 2개월(당일~2개월전)
-      일별 순매수 누적(주식: 코스피+코스닥 합계, 채권: 순매수 / 매일 일중 순매수 적립, 이력 부족 시 전월+당월 근사) ·
+      일별 순매수 누적(주식: 코스피+코스닥 합계, 채권: 순매수 / 구간 PDF 일중 순매수 합산, 누락 시 전월+당월 근사) ·
       출처: 금융감독원 일일 금융시장 동향. 정확성 보장하지 않음.
     </div>
   </div>
@@ -807,10 +866,11 @@ def send_email(subject, html, images=None):
 
 def main():
     try:
-        url, reg = fetch_daily_pdf_url(os.environ["FSS_AUTH_KEY"])
+        auth_key = os.environ["FSS_AUTH_KEY"]
+        url, reg = fetch_daily_pdf_url(auth_key)
         print("PDF:", url, "| 게시:", reg)
         avg = {**SIX_MONTH_AVG, **ecos_six_month_avg()}
-        d = extract(download_pdf(url))
+        d = extract(download_pdf(url), auth_key)
         an = analyze(d, avg, foreign_2m=d.get("foreign_2m"))
         print("결과:", an["result"], "|", an["summary"])
         news_html, news_images = "", []
