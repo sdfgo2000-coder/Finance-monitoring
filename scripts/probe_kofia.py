@@ -1,34 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KOFIA freesis 데이터 API 엔드포인트/serviceId 탐침.
-EC2(한국 IP)에서 실행. 페이지 HTML/JS에서 .do, serviceId, Stat 토큰 추출.
+"""KOFIA freesis 데이터 API 탐침 2단계.
+- 껍데기 페이지 원문 전체 출력
+- 알려진 serviceId(STATBND0100000280=채권대차)로 데이터 API 후보 POST 시도
 """
-import re, requests
+import requests, json
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 H = {"User-Agent": UA, "Referer": "https://freesis.kofia.or.kr/"}
 
-def get(url):
-    r = requests.get(url, headers=H, timeout=30)
-    print(f"\n### GET {url} -> {r.status_code} ({len(r.text)} bytes)")
-    return r.text
+# 1) 껍데기 원문 전체
+r = requests.get("https://freesis.kofia.or.kr/stat/FreeSIS.do?parentDivId=MSIS20000000000000",
+                 headers=H, timeout=30)
+print("===== 껍데기 페이지 원문 =====")
+print(r.text)
+print("===== /원문 =====\n")
 
-# 1) 채권 메뉴 페이지
-txt = get("https://freesis.kofia.or.kr/stat/FreeSIS.do?parentDivId=MSIS20000000000000")
-
-# serviceId 후보 추출
-ids = sorted(set(re.findall(r"STAT[A-Z]{3}\d{10}", txt)))
-print("serviceId 후보:", ids[:60])
-
-# .do / .json 엔드포인트 추출
-endpoints = sorted(set(re.findall(r"[\w/]+\.(?:do|json)", txt)))
-print("엔드포인트:", endpoints[:60])
-
-# 외국인 관련 메뉴명 주변 텍스트
-for m in re.finditer(r".{0,30}외국인.{0,40}", txt):
-    print("  외국인:", m.group(0).replace("\n"," ").strip())
-
-# 메인 JS 파일 경로
-js = sorted(set(re.findall(r'src=["\']([^"\']+\.js)["\']', txt)))
-print("JS 파일:", js[:30])
+# 2) 데이터 API 후보 엔드포인트 POST 시도 (채권대차 serviceId로)
+candidates = [
+    "https://freesis.kofia.or.kr/stat/FreeSISStat.do",
+    "https://freesis.kofia.or.kr/stat/statTotalList.do",
+    "https://freesis.kofia.or.kr/stat/getStatSearchList.do",
+    "https://freesis.kofia.or.kr/websquare/engine/data/dataList.do",
+]
+payload = {"serviceId": "STATBND0100000280", "startDt": "20260601", "endDt": "20260618"}
+for url in candidates:
+    try:
+        rr = requests.post(url, headers=H, json=payload, timeout=20)
+        print(f"[POST json] {url} -> {rr.status_code} ({len(rr.text)}b) {rr.text[:200]!r}")
+    except Exception as e:
+        print(f"[POST json] {url} -> ERR {e}")
+    try:
+        rr = requests.post(url, headers=H, data=payload, timeout=20)
+        print(f"[POST form] {url} -> {rr.status_code} ({len(rr.text)}b) {rr.text[:200]!r}")
+    except Exception as e:
+        print(f"[POST form] {url} -> ERR {e}")
