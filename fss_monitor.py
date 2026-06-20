@@ -43,7 +43,7 @@ FOREIGN_TRIGGER = (-5.0, -7.0)
 FOREIGN_HISTORY = (os.environ.get("FOREIGN_HISTORY")
                    or os.path.expanduser("~/.fss_monitor/foreign_history.csv"))
 # 파서 버전: 채권 행 조건 강화 후 올려 이력 자동 재백필 트리거.
-FOREIGN_PARSER_VER = 3
+FOREIGN_PARSER_VER = 4
 FOREIGN_VER_FILE   = FOREIGN_HISTORY.replace(".csv", ".ver")
 
 LOOKBACK = 7
@@ -171,6 +171,21 @@ def _daily_col(line):
     return None
 
 
+def _prev_col(line):
+    """표 한 행에서 '전일' 확정치(억원)를 반환. ints[-3]=전일, ints[-2]=당일, ints[-1]=잔액."""
+    line = re.sub(r"(\d)\s+,", r"\1,", line)
+    ints = []
+    for t in line.split():
+        if "." in t or "(" in t or "%" in t:
+            continue
+        c = t.replace(",", "")
+        if re.fullmatch(r"[+-]?\d+", c):
+            ints.append(int(c))
+    if len(ints) >= 4:
+        return ints[-3]   # 전일(억원) 확정치
+    return None
+
+
 def _pdf_daily_today(text):
     """PDF '외국인 유가증권 투자' 표 → (주식 합계 당일, 채권 순매수 당일) 억원. 실패 None.
     채권 행은 '순매수(만기상환'으로 시작하는 고유 패턴으로 한정."""
@@ -187,6 +202,26 @@ def _pdf_daily_today(text):
             stock = _daily_col(s)
         elif bond is None and "만기상환" in s and s.startswith("순매수"):
             bond = _daily_col(s)
+        if stock is not None and bond is not None:
+            break
+    return stock, bond
+
+
+def _pdf_daily_prev(text):
+    """PDF → (주식 합계 전일 확정치, 채권 순매수 전일 확정치) 억원. 실패 None."""
+    stock = bond = None
+    in_sec = False
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if "외국인" in s and "유가증권 투자" in s:
+            in_sec = True
+            continue
+        if not in_sec:
+            continue
+        if stock is None and s.startswith("합계"):
+            stock = _prev_col(s)
+        elif bond is None and "만기상환" in s and s.startswith("순매수"):
+            bond = _prev_col(s)
         if stock is not None and bond is not None:
             break
     return stock, bond
@@ -261,11 +296,18 @@ def _backfill_history(auth_key, base, cutoff, hist):
         d = _parse_base_date(text)
         if not (cutoff.isoformat() <= d <= base.isoformat()):
             continue
+        # 전일 확정치를 전날 날짜로 저장 (잠정→확정 자동교정)
+        base_d = dt.date.fromisoformat(d)
+        prev_d = (base_d - dt.timedelta(days=1)).isoformat()
+        st_prev, bo_prev = _pdf_daily_prev(text)
+        if st_prev is not None and bo_prev is not None and cutoff.isoformat() <= prev_d:
+            hist[prev_d] = (st_prev, bo_prev)
+        # 당일 잠정치 (다음날 PDF에서 확정치로 덮어씌워짐)
         st, bo = _pdf_daily_today(text)
         if st is not None and bo is not None:
             if d not in hist:
                 added += 1
-            hist[d] = (st, bo)          # 덮어쓰기(자가치유)
+            hist[d] = (st, bo)
     if posts:
         _save_history(hist)
         print(f"[외인자금] 과거 PDF 백필: 신규 {added}건 / 조회 {len(posts)}건")
@@ -285,13 +327,23 @@ def compute_foreign_2m(text, base_date_str, auth_key=None):
     cutoff = _months_back(base, 2)
 
     stock_today, bond_today = _pdf_daily_today(text)
+    stock_prev, bond_prev = _pdf_daily_prev(text)
     hist = _load_history()
+    prev_date = (base - dt.timedelta(days=1))
+    # 전일 확정치로 덮어씀 (당일 잠정치 → 확정치 자동 교정)
+    if stock_prev is not None and bond_prev is not None:
+        prev_str = prev_date.isoformat()
+        hist[prev_str] = (stock_prev, bond_prev)
+        print(f"[외인자금] 전일({prev_str}) 확정치 갱신: "
+              f"주식 {stock_prev:+,}억 · 채권 {bond_prev:+,}억")
     if stock_today is not None and bond_today is not None:
         hist[base_date_str] = (stock_today, bond_today)
         _save_history(hist)
-        print(f"[외인자금] 당일({base_date_str}) 순매수 적립: "
+        print(f"[외인자금] 당일({base_date_str}) 순매수 적립(잠정): "
               f"주식 {stock_today:+,}억 · 채권 {bond_today:+,}억")
     else:
+        if stock_prev is not None:
+            _save_history(hist)
         print("[외인자금] PDF 일중(당일) 파싱 실패 → 당일 적립 생략")
 
     # 파서 버전이 올라가면 이력을 전부 재백필하여 오적립 자가치유
