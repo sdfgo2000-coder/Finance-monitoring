@@ -43,7 +43,7 @@ FOREIGN_TRIGGER = (-5.0, -7.0)
 FOREIGN_HISTORY = (os.environ.get("FOREIGN_HISTORY")
                    or os.path.expanduser("~/.fss_monitor/foreign_history.csv"))
 # 파서 버전: 채권 행 조건 강화 후 올려 이력 자동 재백필 트리거.
-FOREIGN_PARSER_VER = 5
+FOREIGN_PARSER_VER = 6
 FOREIGN_VER_FILE   = FOREIGN_HISTORY.replace(".csv", ".ver")
 
 LOOKBACK = 7
@@ -181,8 +181,8 @@ def _prev_col(line):
         c = t.replace(",", "")
         if re.fullmatch(r"[+-]?\d+", c):
             ints.append(int(c))
-    if len(ints) >= 4:
-        return ints[-3]   # 전일(억원) 확정치
+    if len(ints) >= 3:
+        return ints[-3]   # 전일(억원) 확정치: [전일, 당일, 잔액] 구조에서 -3번째
     return None
 
 
