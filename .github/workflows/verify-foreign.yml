@@ -7,6 +7,10 @@ on:
         description: "검증 기준일 (YYYY-MM-DD)"
         required: true
         default: "2026-06-18"
+      script:
+        description: "실행할 검증 스크립트"
+        required: true
+        default: "scripts/verify_date.py"
 
 jobs:
   verify:
@@ -23,4 +27,4 @@ jobs:
         env:
           FSS_AUTH_KEY: ${{ secrets.FSS_AUTH_KEY }}
           TARGET_DATE:  ${{ github.event.inputs.target_date }}
-        run: ~/venv/bin/python scripts/verify_date.py
+        run: ~/venv/bin/python ${{ github.event.inputs.script }}
