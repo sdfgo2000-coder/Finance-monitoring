@@ -1,0 +1,26 @@
+name: Verify Foreign Fund (one-off)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "검증 기준일 (YYYY-MM-DD)"
+        required: true
+        default: "2026-06-18"
+
+jobs:
+  verify:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: claude/happy-noether-t5sj55
+
+      - name: Install dependencies
+        run: ~/venv/bin/pip install -r requirements.txt
+
+      - name: Verify foreign 2-month cumulative
+        env:
+          FSS_AUTH_KEY: ${{ secrets.FSS_AUTH_KEY }}
+          TARGET_DATE:  ${{ github.event.inputs.target_date }}
+        run: ~/venv/bin/python scripts/verify_date.py
