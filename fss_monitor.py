@@ -43,7 +43,7 @@ FOREIGN_TRIGGER = (-5.0, -7.0)
 FOREIGN_HISTORY = (os.environ.get("FOREIGN_HISTORY")
                    or os.path.expanduser("~/.fss_monitor/foreign_history.csv"))
 # 파서 버전: 채권 행 조건 강화 후 올려 이력 자동 재백필 트리거.
-FOREIGN_PARSER_VER = 6
+FOREIGN_PARSER_VER = 7
 FOREIGN_VER_FILE   = FOREIGN_HISTORY.replace(".csv", ".ver")
 
 LOOKBACK = 7
@@ -207,6 +207,24 @@ def _pdf_daily_today(text):
     return stock, bond
 
 
+def _pdf_prev_date(text, base):
+    """PDF 표 헤더의 '전일' 실제 날짜를 반환(휴일/주말 건너뜀 반영).
+    헤더 예: '주식 ... 6월17일 6월18일 잔 액 ...' → 전일=6/17. base로 연도 보정."""
+    for ln in text.split("\n"):
+        if "잔" in ln and "월" in ln and "일" in ln:
+            ms = re.findall(r"(\d{1,2})월\s*(\d{1,2})일", ln)
+            if len(ms) >= 2:
+                mm, dd = int(ms[0][0]), int(ms[0][1])   # 첫 번째 = 전일
+                year = base.year
+                if mm > base.month:   # 연초 경계(12월→1월)
+                    year -= 1
+                try:
+                    return dt.date(year, mm, dd)
+                except ValueError:
+                    return None
+    return None
+
+
 def _pdf_daily_prev(text):
     """PDF → (주식 합계 전일 확정치, 채권 순매수 전일 확정치) 억원. 실패 None."""
     stock = bond = None
@@ -273,6 +291,9 @@ def _backfill_history(auth_key, base, cutoff, hist):
     if not auth_key:
         print("[외인자금] FSS 인증키 없음 → 과거 PDF 백필 생략")
         return hist
+    # 윈도우 구간 기존 항목 제거(유령 주말/휴일 날짜·구버전 오적립 정리 후 재구축)
+    for d in [k for k in hist if cutoff <= dt.date.fromisoformat(k) <= base]:
+        del hist[d]
     posts, seen = [], set()
     for cs, ce in _date_chunks(cutoff, base, 28):
         try:
@@ -298,12 +319,13 @@ def _backfill_history(auth_key, base, cutoff, hist):
         d = _parse_base_date(text)
         if not (cutoff.isoformat() <= d <= base.isoformat()):
             continue
-        # 전일 확정치를 전날 날짜로 저장 (잠정→확정 자동교정)
+        # 전일 확정치를 헤더의 실제 전일 날짜로 저장 (잠정→확정 자동교정)
         base_d = dt.date.fromisoformat(d)
-        prev_d = (base_d - dt.timedelta(days=1)).isoformat()
+        prev_date = _pdf_prev_date(text, base_d)
         st_prev, bo_prev = _pdf_daily_prev(text)
-        if st_prev is not None and bo_prev is not None and cutoff.isoformat() <= prev_d:
-            hist[prev_d] = (st_prev, bo_prev)
+        if (prev_date and st_prev is not None and bo_prev is not None
+                and cutoff <= prev_date <= base):
+            hist[prev_date.isoformat()] = (st_prev, bo_prev)
         # 당일 잠정치 (다음날 PDF에서 확정치로 덮어씌워짐)
         st, bo = _pdf_daily_today(text)
         if st is not None and bo is not None:
@@ -331,9 +353,9 @@ def compute_foreign_2m(text, base_date_str, auth_key=None):
     stock_today, bond_today = _pdf_daily_today(text)
     stock_prev, bond_prev = _pdf_daily_prev(text)
     hist = _load_history()
-    prev_date = (base - dt.timedelta(days=1))
+    prev_date = _pdf_prev_date(text, base)   # 헤더의 실제 전일(영업일) 날짜
     # 전일 확정치로 덮어씀 (당일 잠정치 → 확정치 자동 교정)
-    if stock_prev is not None and bond_prev is not None:
+    if prev_date and stock_prev is not None and bond_prev is not None:
         prev_str = prev_date.isoformat()
         hist[prev_str] = (stock_prev, bond_prev)
         print(f"[외인자금] 전일({prev_str}) 확정치 갱신: "
