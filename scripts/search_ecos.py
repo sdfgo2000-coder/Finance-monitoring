@@ -1,35 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ECOS에서 외국인 채권/주식 관련 통계 코드 검색.
-실행: ECOS_KEY=xxx ~/venv/bin/python scripts/search_ecos.py
-"""
+"""ECOS 통계목록 전체 조회 후 외국인 관련 항목 필터링."""
 import os, requests
 
 KEY = os.environ["ECOS_KEY"]
 BASE = "https://ecos.bok.or.kr/api"
 
-def stat_search(kw):
-    url = f"{BASE}/StatisticSearch/{KEY}/json/kr/1/100/{kw}"
-    r = requests.get(url, timeout=30)
-    data = r.json()
-    rows = data.get("StatisticSearch", {}).get("row", [])
-    return rows
+# 통계목록 조회
+url = f"{BASE}/StatisticTableList/{KEY}/json/kr/1/500"
+r = requests.get(url, timeout=30)
+data = r.json()
+rows = data.get("StatisticTableList", {}).get("row", [])
+print(f"엔트리 수: {len(rows)}")
 
-def stat_list(stat_code):
-    url = f"{BASE}/StatisticItemList/{KEY}/json/kr/1/200/{stat_code}"
-    r = requests.get(url, timeout=30)
-    data = r.json()
-    rows = data.get("StatisticItemList", {}).get("row", [])
-    return rows
+keywords = ["외국인", "채권", "주식순매수", "증권투자"]
+for row in rows:
+    name = row.get("STAT_NAME", "") + row.get("ITEM_NAME", "")
+    if any(k in name for k in keywords):
+        print(f"  [{row.get('STAT_CODE')}] {row.get('STAT_NAME')} / {row.get('ITEM_NAME','')}")
 
-keywords = ["외국인", "외국인채권", "외국인주식", "채권순매수", "외국인투자"]
-seen = set()
-for kw in keywords:
-    rows = stat_search(kw)
-    for r in rows:
-        code = r.get("STAT_CODE","")
-        name = r.get("STAT_NAME","")
-        item = r.get("ITEM_NAME1","")
-        if code not in seen:
-            seen.add(code)
-            print(f"[{code}] {name} | {item}")
+# raw 응답 일부 확인
+if not rows:
+    print("응답 raw:", str(data)[:500])
