@@ -43,7 +43,7 @@ FOREIGN_TRIGGER = (-5.0, -7.0)
 FOREIGN_HISTORY = (os.environ.get("FOREIGN_HISTORY")
                    or os.path.expanduser("~/.fss_monitor/foreign_history.csv"))
 # 파서 버전: 채권 행 조건 강화 후 올려 이력 자동 재백필 트리거.
-FOREIGN_PARSER_VER = 4
+FOREIGN_PARSER_VER = 5
 FOREIGN_VER_FILE   = FOREIGN_HISTORY.replace(".csv", ".ver")
 
 LOOKBACK = 7
@@ -283,6 +283,8 @@ def _backfill_history(auth_key, base, cutoff, hist):
                     posts.append(p)
         except Exception as ex:
             print(f"[외인자금] 백필 목록조회 실패({cs}~{ce}): {ex}")
+    # 날짜 오름차순 처리: 당일 잠정치 먼저 → 다음날 PDF의 전일 확정치가 나중에 덮어씀
+    posts.sort(key=lambda p: p.get("regDate", ""))
     added = 0
     for p in posts:
         url = p.get("atchfileUrl")
