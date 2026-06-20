@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ECOS 통계목록 전체 조회 후 외국인 관련 항목 필터링."""
+"""ECOS 채권보유표 항목 상세 + 외국인 관련 코드 실제 데이터 조회."""
 import os, requests
 
 KEY = os.environ["ECOS_KEY"]
 BASE = "https://ecos.bok.or.kr/api"
 
-# 통계목록 조회
-url = f"{BASE}/StatisticTableList/{KEY}/json/kr/1/500"
-r = requests.get(url, timeout=30)
-data = r.json()
-rows = data.get("StatisticTableList", {}).get("row", [])
-print(f"엔트리 수: {len(rows)}")
+def item_list(stat_code):
+    url = f"{BASE}/StatisticItemList/{KEY}/json/kr/1/300/{stat_code}"
+    r = requests.get(url, timeout=30)
+    return r.json().get("StatisticItemList", {}).get("row", [])
 
-keywords = ["외국인", "채권", "주식순매수", "증권투자"]
-for row in rows:
-    name = row.get("STAT_NAME", "") + row.get("ITEM_NAME", "")
-    if any(k in name for k in keywords):
-        print(f"  [{row.get('STAT_CODE')}] {row.get('STAT_NAME')} / {row.get('ITEM_NAME','')}")
+def fetch(stat_code, item_code, start="20260401", end="20260618", period="D"):
+    url = (f"{BASE}/StatisticSearch/{KEY}/json/kr/1/100/"
+           f"{stat_code}/{period}/{start}/{end}/{item_code}")
+    r = requests.get(url, timeout=30)
+    data = r.json()
+    rows = data.get("StatisticSearch", {}).get("row", [])
+    if not rows:
+        print("  → 데이터 없음:", str(data)[:200])
+    return rows
 
-# raw 응답 일부 확인
-if not rows:
-    print("응답 raw:", str(data)[:500])
+# 채권보유표 항목 탐색
+print("=== 채권보유표(0000000805) 항목 ===")
+for row in item_list("0000000805"):
+    name = " / ".join(filter(None, [row.get(f"ITEM_NAME{i}") for i in range(1,5)]))
+    print(f"  [{row.get('ITEM_CODE')}] {name}")
+
+# 282Y006 채권발행-보유관계표 항목 탐색
+print("\n=== 채권발행-보유관계표(282Y006) 항목 ===")
+for row in item_list("282Y006"):
+    name = " / ".join(filter(None, [row.get(f"ITEM_NAME{i}") for i in range(1,5)]))
+    print(f"  [{row.get('ITEM_CODE')}] {name}")
